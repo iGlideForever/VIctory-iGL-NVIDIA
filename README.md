@@ -35,10 +35,10 @@ Install [Rust](https://rustup.rs) and the
 with "Desktop development with C++", then in PowerShell:
 
 ```powershell
-git clone https://github.com/trustno1-coder/VIctory-NVIDIA
-cd VIctory-NVIDIA
+git clone https://github.com/iGlideForever/VIctory-iGL-NVIDIA.git
+cd VIctory-iGL-NVIDIA
 .\Get-NVIDIA-DLSS.cmd
-powershell -ExecutionPolicy Bypass -File scripts\play-nvidia.ps1 -Exe 'D:\Games\MyDump\game_scarlett_master.exe'
+powershell -ExecutionPolicy Bypass -File .\scripts\play-nvidia.ps1 -Exe "D:\Games\MyDump\game_scarlett_master.exe"
 ```
 
 Put the path to **your** `game_scarlett_master.exe` in the last line. The
