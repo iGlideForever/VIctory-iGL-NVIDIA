@@ -509,7 +509,7 @@ fn twin_texture(
         TWINS[1].fetch_add(1, Relaxed);
         return None;
     };
-    let _ = crate::host::resident(&host.device, &texture);
+    let _ = crate::host::resident_at(&host.device, &texture, crate::host::RES_TWIN);
     crate::host::name(&texture, || {
         format!("depth twin {}x{} f{}", d.width, d.height, d.format)
     });
@@ -570,7 +570,7 @@ fn twin_texture(
             tracing::warn!(error = %e, desc = ?d, "no twin for a depth plane");
         }
         texture.map(|texture| {
-            let _ = crate::host::resident(&host.device, &texture);
+            let _ = crate::host::resident_at(&host.device, &texture, crate::host::RES_TWIN);
             crate::host::name(&texture, || {
                 format!("depth plane twin {}x{} f{}", d.width, d.height, d.format)
             });
@@ -2309,8 +2309,13 @@ pub(crate) fn let_go_idle() {
     let from = if part == PART { FROM.load(Relaxed) } else { 0 };
     let mut looked = 0;
     let began = std::time::Instant::now();
+    // (`sweep_limit`) Above the line's critical band (idle 1.5 s) nothing is
+    // spared and the count is not bounded: the card is past its budget.
+    let critical = idle_ms <= 1_500;
+    let [limit, costly] = sweep_limit();
+    let mut spared = 0u64;
     for at in all.range(from..).take(part).copied().chain(by_age.iter().map(|&(_, at)| at)) {
-        if bytes >= most {
+        if bytes >= most || (!critical && went >= limit) {
             break;
         }
         looked += 1;
@@ -2323,6 +2328,12 @@ pub(crate) fn let_go_idle() {
         // (Without its lock first: most were used lately or have none.)
         let used = r.host.used.load(Relaxed);
         if used == 0 || !fills(&r.desc) || !crate::host::long_ago(used, idle_ms, IDLE_FRAMES) || crate::texture::host_wrote(at) {
+            continue;
+        }
+        // Costly to make again (big: its upload, detiling and memory come
+        // back all at once): kept while the card is not past its line.
+        if !critical && footprint(&r.desc).is_some_and(|f| f.size >= costly) {
+            spared += 1;
             continue;
         }
         let gone = {
@@ -2357,6 +2368,7 @@ pub(crate) fn let_go_idle() {
     SWEPT_US[0].fetch_add(1, Relaxed);
     SWEPT_US[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
     SWEPT_US[2].fetch_max(began.elapsed().as_micros() as u64, Relaxed);
+    sweep_line(memory, idle_ms, spared);
     if went > 0 {
         crate::host::trail(|| {
             format!(
@@ -2366,6 +2378,72 @@ pub(crate) fn let_go_idle() {
             )
         });
     }
+}
+
+/// `VICTORY_SWEEP_LIMIT=<most a sweep>,<costly MiB>`: a sweep of
+/// [`let_go_idle`] (one a second) lets go at most that many host copies, and
+/// none of a texture whose footprint is that many MiB or more, while the
+/// card is not past its line (idle 1.5 s, the critical band). Unset: no
+/// bound and nothing spared, as before.
+///
+/// As Eden's texture cache does (yuzu's successor, GPL-3.0-or-later,
+/// `TextureCache::RunGarbageCollector`: 10, 20 or 40 images a frame by the
+/// memory in use, `CostlyLoad` images kept unless memory is critical): on an
+/// RTX 5080 Laptop with frame generation the card sat inside the band where
+/// textures idle 5 s go, and a sweep could let go hundreds of megabytes that
+/// came back when the view turned (whole textures popping out and in; play
+/// sessions of 2026-11-27).
+fn sweep_limit() -> [u64; 2] {
+    static SET: std::sync::OnceLock<[u64; 2]> = std::sync::OnceLock::new();
+    *SET.get_or_init(|| {
+        let set = std::env::var("VICTORY_SWEEP_LIMIT").unwrap_or_default();
+        let mut parts = set.split(',').map(|t| t.trim().parse::<u64>().ok().filter(|v| *v > 0));
+        match (parts.next().flatten(), parts.next().flatten()) {
+            (Some(most), costly) => [most, costly.map_or(u64::MAX, |mib| mib << 20)],
+            _ => [u64::MAX, u64::MAX],
+        }
+    })
+}
+
+/// Every ten seconds, in every build: the host copies of textures the title
+/// fills let go by the sweep and made again after that (count, MB), since
+/// the last line and since the start, with the card's use against the line.
+/// Whether what goes comes back is what says the sweep costs more than it
+/// gives.
+fn sweep_line(memory: Option<[u64; 4]>, idle_ms: u64, spared: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    static LAST: std::sync::Mutex<Option<(std::time::Instant, [u64; 4], u64)>> = std::sync::Mutex::new(None);
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    let now = [2, 3, 4, 5].map(|i| KINDS[i].load(Relaxed));
+    let Some((at, was, spared_all)) = last.as_mut() else {
+        *last = Some((std::time::Instant::now(), now, spared));
+        return;
+    };
+    *spared_all += spared;
+    if at.elapsed() < std::time::Duration::from_secs(10) {
+        return;
+    }
+    let d = [0, 1, 2, 3].map(|i| now[i].saturating_sub(was[i]));
+    let (use_pct, line_pct) = match memory {
+        Some([budget, used, ..]) if budget > 0 => (used * 100 / budget, room_line(budget) * 100 / budget),
+        _ => (0, 0),
+    };
+    tracing::info!(
+        "texture sweep, last 10 s: {} let go ({} MB), {} made again ({} MB), {} kept as costly; since the start {} let go \
+         ({} MB), {} made again ({} MB); the card at {use_pct}% of its budget, the line at {line_pct}%, idle time {} s \
+         (VICTORY_SWEEP_LIMIT)",
+        d[0],
+        d[1] >> 20,
+        d[2],
+        d[3] >> 20,
+        *spared_all,
+        now[0],
+        now[1] >> 20,
+        now[2],
+        now[3] >> 20,
+        idle_ms / 1000
+    );
+    *last = Some((std::time::Instant::now(), now, 0));
 }
 
 /// Since the start: looks of [`let_go_idle`], their microseconds, and the
@@ -2770,7 +2848,7 @@ fn host_texture_as(
     if !reserved
         && made.is_ok()
         && let Some(t) = &texture
-        && let Err(e) = crate::host::resident(&host.device, t).and_then(|()| crate::host::mapped(&host.device))
+        && let Err(e) = crate::host::resident_at(&host.device, t, crate::host::RES_HOST_TEXTURE).and_then(|()| crate::host::mapped(&host.device))
     {
         tracing::warn!(error = %e, desc = ?d, "a host texture is not resident");
         texture = None;

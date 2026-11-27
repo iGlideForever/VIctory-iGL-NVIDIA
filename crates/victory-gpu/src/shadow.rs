@@ -425,6 +425,9 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
     if !host.card_ready() {
         return None;
     }
+    // The title's buffers get card copies: from now on 64 KiB ones are made
+    // ahead (`crate::ahead`; `Host::uav_buffer` takes them from the store).
+    crate::ahead::want_card();
     // Only while the card has room: with this copy on it, a fifth of the
     // budget the system gives us must still be free. Copies are made when
     // the world loads, before the textures fill the card; the texture
@@ -2975,6 +2978,33 @@ pub(crate) fn windows() -> [u64; 3] {
     [LET_GO[0].load(Ordering::Relaxed), LET_GO[1].load(Ordering::Relaxed), asked]
 }
 
+/// For the memory line: the windows a descriptor slot still names that
+/// nothing asked for in the last 30 s and 30 frames, with their bytes and
+/// the bytes of their pages ever copied. [`let_go_idle`] leaves them (a
+/// slot keeps their buffer until the title writes the slot again): what
+/// letting go of the copies only stale slots keep would free.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn window_pinned() -> [u64; 3] {
+    let mut out = [0u64; 3];
+    let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+    // Each copy once: a window may stand under several keys.
+    let mut seen = std::collections::HashSet::new();
+    for s in loose.values() {
+        if !seen.insert(Arc::as_ptr(s) as usize)
+            || crate::reuse::references_outside(&s.buffer) <= 1
+            || !crate::host::long_ago(s.used.load(Ordering::Relaxed), 30_000, 30)
+        {
+            continue;
+        }
+        let copied = s.copied.lock().unwrap_or_else(|e| e.into_inner());
+        let pages = copied.iter().filter(|&&at| at != 0).count() as u64;
+        out[0] += 1;
+        out[1] += s.len;
+        out[2] += (pages * PAGE as u64).min(s.len);
+    }
+    out
+}
+
 /// For the memory line, of the windows alive: the bytes of their pages
 /// ever copied from title memory (the rest of each window is memory the
 /// host zeroed and nothing read: what a window made no bigger than what is
@@ -2991,7 +3021,7 @@ pub(crate) fn window_use() -> [u64; 8] {
         let copied = s.copied.lock().unwrap_or_else(|e| e.into_inner());
         let pages = copied.iter().filter(|&&at| at != 0).count() as u64;
         out[0] += (pages * PAGE as u64).min(s.len);
-        if crate::host::references(&s.buffer) > 1 {
+        if crate::reuse::references_outside(&s.buffer) > 1 {
             out[1] += 1;
             out[2] += s.len;
         }
@@ -3037,7 +3067,7 @@ pub(crate) fn let_go_idle() {
             .filter(|(_, s)| {
                 Arc::strong_count(s) == 1
                     && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
-                    && crate::host::references(&s.buffer) == 1
+                    && crate::reuse::references_outside(&s.buffer) == 1
             })
             .map(|(key, _)| *key)
             .collect();
@@ -3055,6 +3085,145 @@ pub(crate) fn let_go_idle() {
         // Nothing runs now and nothing names it: freed at once unless a
         // submission is running after all.
         crate::host::retire(shadow);
+    }
+}
+
+/// `VICTORY_SLOT_LET_GO`: the seconds a window's copy that only descriptor
+/// slots keep stays unread before [`let_go_slot_held`] makes those slots
+/// null (30; `0`: never; 5 at least).
+fn slot_let_go_s() -> u64 {
+    static S: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *S.get_or_init(|| parse_slot_let_go(std::env::var("VICTORY_SLOT_LET_GO").ok().as_deref()))
+}
+
+fn parse_slot_let_go(set: Option<&str>) -> u64 {
+    match set.map(str::trim) {
+        None | Some("") => 30,
+        Some(v) => v.parse::<u64>().map_or(30, |s| if s == 0 { 0 } else { s.clamp(5, 3600) }),
+    }
+}
+
+/// Since the start ([`let_go_slot_held`]): sweeps that found copies to look
+/// for, title slots made null, copies no slot kept after (so [`let_go_idle`]
+/// lets them go) and their bytes, free dynamic slots made null, dynamic
+/// slots a list held, and title slots left (read or remade meanwhile); and,
+/// of the last sweep, the copies looked for and the slots found keeping
+/// them.
+pub(crate) static SLOT_LET_GO: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+
+/// Lets go of the copies of windows that only descriptor slots keep (R1).
+/// A slot keeps the host buffer it views until the title writes the slot
+/// again (`HostHeap::kept`), so [`let_go_idle`] never let go of a window a
+/// stale slot named: 504 such windows, 2.5 GB of copies of which 1.29 GB
+/// had pages copied, unread for 30 s two minutes into the world (run
+/// 130455, RTX 5080 Laptop). Here the slots of a window nothing has asked
+/// for in [`slot_let_go_s`] seconds and 30 frames, that no list or pass
+/// holds, are made null, as if the title had written nothing there; a draw
+/// that reads one through a table again makes it again, with a new copy.
+/// (A shader that picks the slot by index from a heap no pass looks at
+/// reads zeros there instead of a copy at least that old.)
+///
+/// At most every 10 s, on a thread of its own: the slots are looked for
+/// over every view heap (a lock at a time), then each is let go under its
+/// own lock, after which the window is looked at again. The table of
+/// windows is never held while a slot's lock is taken: the makers of slots
+/// take that lock first and the table under it.
+pub(crate) fn let_go_slot_held() {
+    let idle_s = slot_let_go_s();
+    if idle_s == 0 {
+        return;
+    }
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    static RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let now = crate::host::coarse_ms();
+    let last = LAST.load(Ordering::Relaxed);
+    if now < last + 10_000 || LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+        return;
+    }
+    if RUNNING.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let spawned = std::thread::Builder::new().name("victory-slot-let-go".into()).spawn(move || {
+        slot_held_sweep(idle_s * 1000);
+        RUNNING.store(false, Ordering::Relaxed);
+    });
+    if spawned.is_err() {
+        RUNNING.store(false, Ordering::Relaxed);
+    }
+}
+
+/// Whether a window's copy is one [`let_go_slot_held`] lets its slots go
+/// of: no list or pass holds it, a slot does, and it was not asked for in
+/// `idle_ms` and 30 frames.
+fn slot_held_idle(s: &Arc<Shadow>, idle_ms: u64) -> bool {
+    Arc::strong_count(s) == 1
+        && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, 30)
+        && crate::reuse::references_outside(&s.buffer) > 1
+}
+
+fn slot_held_sweep(idle_ms: u64) {
+    use windows::core::Interface;
+    // The windows, by their buffer: under the table's lock for the look
+    // alone.
+    let windows: std::collections::HashMap<usize, ((u64, u64), u64)> = {
+        let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+        loose
+            .iter()
+            .filter(|(_, s)| slot_held_idle(s, idle_ms))
+            .map(|(&key, s)| (s.buffer.as_raw() as usize, (key, s.len)))
+            .collect()
+    };
+    if windows.is_empty() {
+        return;
+    }
+    SLOT_LET_GO[0].fetch_add(1, Ordering::Relaxed);
+    SLOT_LET_GO[7].store(windows.len() as u64, Ordering::Relaxed);
+    let buffers: std::collections::HashSet<usize> = windows.keys().copied().collect();
+    // Title slots made null, free dynamic ones, dynamic ones lists held,
+    // title slots left, slots found.
+    let mut n = [0u64; 5];
+    crate::descriptor::each_host_view_heap(|heap| {
+        for (index, raw) in heap.slots_keeping(&buffers) {
+            n[4] += 1;
+            if !heap.is_title_slot(index) {
+                match heap.let_go_free_dynamic(index, raw) {
+                    Some(true) => n[1] += 1,
+                    _ => n[2] += 1,
+                }
+                continue;
+            }
+            let Some(&(key, _)) = windows.get(&raw) else { continue };
+            // Still the same window, still unread and held by no list
+            // (under the slot's lock, the table's under it, as its makers).
+            let still = || {
+                let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+                loose
+                    .get(&key)
+                    .is_some_and(|s| s.buffer.as_raw() as usize == raw && slot_held_idle(s, idle_ms))
+            };
+            if heap.let_go_slot(index, raw, still) {
+                n[0] += 1;
+            } else {
+                n[3] += 1;
+            }
+        }
+    });
+    let nulled = n[0] + n[1];
+    for (at, by) in [(1, n[0]), (4, n[1]), (5, n[2]), (6, n[3])] {
+        SLOT_LET_GO[at].fetch_add(by, Ordering::Relaxed);
+    }
+    SLOT_LET_GO[8].store(n[4], Ordering::Relaxed);
+    // The windows no slot keeps now: `let_go_idle` lets them go next.
+    let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+    for &(key, len) in windows.values() {
+        if loose.get(&key).is_some_and(|s| Arc::strong_count(s) == 1 && crate::reuse::references_outside(&s.buffer) == 1) {
+            SLOT_LET_GO[2].fetch_add(1, Ordering::Relaxed);
+            SLOT_LET_GO[3].fetch_add(len, Ordering::Relaxed);
+        }
+    }
+    drop(loose);
+    if nulled > 0 {
+        crate::host::trail(|| format!("slot let-go: {nulled} slots made null that only kept idle window copies ({} title, {} free dynamic)", n[0], n[1]));
     }
 }
 
@@ -5674,7 +5843,7 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
         // Held by the map alone (no list), its buffer by the copy alone (no
         // slot shows it), and not asked for lately.
         map.retain(|_, (shadow, used)| {
-            Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + LATELY > now
+            Arc::strong_count(shadow) > 1 || crate::reuse::references_outside(&shadow.buffer) > 1 || *used + LATELY > now
         });
     }
     let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
@@ -5925,4 +6094,20 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod slot_let_go_tests {
+    use super::parse_slot_let_go;
+
+    #[test]
+    fn the_switch_reads_seconds_and_zero_turns_it_off() {
+        assert_eq!(parse_slot_let_go(None), 30);
+        assert_eq!(parse_slot_let_go(Some("")), 30);
+        assert_eq!(parse_slot_let_go(Some("0")), 0);
+        assert_eq!(parse_slot_let_go(Some(" 60 ")), 60);
+        assert_eq!(parse_slot_let_go(Some("1")), 5);
+        assert_eq!(parse_slot_let_go(Some("99999")), 3600);
+        assert_eq!(parse_slot_let_go(Some("soon")), 30);
+    }
 }

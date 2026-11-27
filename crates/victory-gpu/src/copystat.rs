@@ -379,6 +379,173 @@ fn big_blocks() -> String {
     if text.is_empty() { "none".into() } else { text.join(", ") }
 }
 
+/// Our own blocks by the code that made them. One block in [`SAMPLE`] (by
+/// its address) and every block of [`SAMPLED_ALL`] bytes and more has the
+/// callers that made it kept while it lives: the memory line counts 2
+/// million blocks of ours under 4 KiB (970 MB) and 1.25 GB in big ones, and
+/// says nothing of whose they are (fork diag log, 2026-11-27). The memory
+/// map's thread lists the sites holding the most ([`log_sites`]), by the
+/// program's addresses; its PDB names them afterwards.
+const SAMPLE: u64 = 256;
+const SAMPLED_ALL: usize = 64 << 10;
+const FRAMES: usize = 14;
+const SITES: usize = 8192;
+/// Blocks kept track of: buckets of four by address.
+const TRACK_BUCKETS: usize = 1 << 15;
+
+struct Site {
+    key: AtomicU64,
+    frames: [std::sync::atomic::AtomicUsize; FRAMES],
+    blocks: std::sync::atomic::AtomicI64,
+    bytes: std::sync::atomic::AtomicI64,
+}
+
+static SITE: [Site; SITES] = [const {
+    Site {
+        key: AtomicU64::new(0),
+        frames: [const { std::sync::atomic::AtomicUsize::new(0) }; FRAMES],
+        blocks: std::sync::atomic::AtomicI64::new(0),
+        bytes: std::sync::atomic::AtomicI64::new(0),
+    }
+}; SITES];
+static TRACK_AT: [std::sync::atomic::AtomicUsize; TRACK_BUCKETS * 4] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; TRACK_BUCKETS * 4];
+static TRACK_SITE: [std::sync::atomic::AtomicU32; TRACK_BUCKETS * 4] =
+    [const { std::sync::atomic::AtomicU32::new(0) }; TRACK_BUCKETS * 4];
+/// Sampled blocks not kept track of (their site or bucket full).
+static SITES_LOST: AtomicU64 = AtomicU64::new(0);
+
+fn mixed(at: usize) -> u64 {
+    ((at as u64) >> 4).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+}
+
+/// Whether the block at `at` of `size` bytes is one kept track of, and what
+/// it stands for.
+fn sampled(at: *mut u8, size: usize) -> Option<i64> {
+    if size >= SAMPLED_ALL {
+        Some(1)
+    } else if (mixed(at as usize) >> 40).is_multiple_of(SAMPLE) {
+        Some(SAMPLE as i64)
+    } else {
+        None
+    }
+}
+
+fn bucket(at: *mut u8) -> usize {
+    ((mixed(at as usize) >> 12) as usize % TRACK_BUCKETS) * 4
+}
+
+/// Keeps track of the block made at `at` if it is sampled. Nothing here
+/// allocates; a block made while its own callers are asked for is left out.
+fn site_made(at: *mut u8, size: usize) {
+    let Some(weight) = sampled(at, size) else { return };
+    thread_local!(static ASKING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) });
+    if ASKING.try_with(|a| a.replace(true)).unwrap_or(true) {
+        return;
+    }
+    let mut frames = [std::ptr::null_mut(); FRAMES];
+    // SAFETY: room for that many frames; no hash asked for.
+    let n = unsafe {
+        windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace(
+            2,
+            FRAMES as u32,
+            frames.as_mut_ptr(),
+            std::ptr::null_mut(),
+        )
+    } as usize;
+    let _ = ASKING.try_with(|a| a.set(false));
+    let mut key = 0xcbf2_9ce4_8422_2325u64;
+    for f in &frames[..n] {
+        key = (key ^ *f as u64).wrapping_mul(0x100_0000_01b3);
+    }
+    let key = key | 1;
+    let start = key as usize % SITES;
+    let mut site = None;
+    for probe in 0..64 {
+        let i = (start + probe) % SITES;
+        match SITE[i].key.compare_exchange(0, key, Relaxed, Relaxed) {
+            Ok(_) => {
+                for (slot, f) in SITE[i].frames.iter().zip(&frames[..n]) {
+                    slot.store(*f as usize, Relaxed);
+                }
+                site = Some(i);
+                break;
+            }
+            Err(k) if k == key => {
+                site = Some(i);
+                break;
+            }
+            Err(_) => {}
+        }
+    }
+    let Some(i) = site else {
+        SITES_LOST.fetch_add(1, Relaxed);
+        return;
+    };
+    let b = bucket(at);
+    for j in b..b + 4 {
+        if TRACK_AT[j].compare_exchange(0, at as usize, Relaxed, Relaxed).is_ok() {
+            TRACK_SITE[j].store(i as u32, Relaxed);
+            SITE[i].blocks.fetch_add(weight, Relaxed);
+            SITE[i].bytes.fetch_add(weight * size as i64, Relaxed);
+            return;
+        }
+    }
+    SITES_LOST.fetch_add(1, Relaxed);
+}
+
+/// The block at `at` goes (asked before the system's allocator has it back).
+fn site_gone(at: *mut u8, size: usize) {
+    let Some(weight) = sampled(at, size) else { return };
+    let b = bucket(at);
+    for j in b..b + 4 {
+        if TRACK_AT[j].load(Relaxed) == at as usize {
+            let i = TRACK_SITE[j].load(Relaxed) as usize;
+            TRACK_AT[j].store(0, Relaxed);
+            SITE[i].blocks.fetch_sub(weight, Relaxed);
+            SITE[i].bytes.fetch_sub(weight * size as i64, Relaxed);
+            return;
+        }
+    }
+}
+
+/// The sites holding the most of our own memory now (estimated from the
+/// samples), with their callers as offsets in the program.
+fn log_sites() {
+    // SAFETY: the program's own module.
+    let base = unsafe { windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(std::ptr::null()) } as usize;
+    let mut held: Vec<(i64, i64, usize)> = (0..SITES)
+        .filter(|&i| SITE[i].key.load(Relaxed) != 0)
+        .map(|i| (SITE[i].bytes.load(Relaxed), SITE[i].blocks.load(Relaxed), i))
+        .filter(|h| h.0 > 0)
+        .collect();
+    let total: i64 = held.iter().map(|h| h.0).sum();
+    held.sort_unstable_by_key(|h| std::cmp::Reverse(h.0));
+    let text: Vec<String> = held
+        .iter()
+        .take(40)
+        .map(|&(bytes, blocks, i)| {
+            let frames: Vec<String> = SITE[i]
+                .frames
+                .iter()
+                .map(|f| f.load(Relaxed))
+                .take_while(|&f| f != 0)
+                .map(|f| if f > base && f - base < 1 << 30 { format!("{:x}", f - base) } else { format!("@{f:x}") })
+                .collect();
+            format!("{:.1} MB in {} blocks at {}", bytes as f64 / (1 << 20) as f64, blocks, frames.join(","))
+        })
+        .collect();
+    tracing::info!(
+        "memory, our own by the code that made it (one block in {SAMPLE} sampled, every one of {} KiB and more; \
+         offsets in the program, base {base:#x}): {:.0} MB in {} sites, {} samples not kept; {}",
+        SAMPLED_ALL >> 10,
+        total as f64 / (1 << 20) as f64,
+        held.len(),
+        SITES_LOST.load(Relaxed),
+        text.join("; ")
+    );
+}
+
 /// The system's allocator with every block counted in [`OWN`] (two atomic
 /// additions per allocation and per release: diagnostics builds only).
 struct Counting;
@@ -392,6 +559,7 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
         if !at.is_null() {
             own(layout.size(), true);
             big(at, layout.size(), true);
+            site_made(at, layout.size());
         }
         at
     }
@@ -402,6 +570,7 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
         if !at.is_null() {
             own(layout.size(), true);
             big(at, layout.size(), true);
+            site_made(at, layout.size());
         }
         at
     }
@@ -409,11 +578,14 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
     unsafe fn dealloc(&self, at: *mut u8, layout: std::alloc::Layout) {
         own(layout.size(), false);
         big(at, layout.size(), false);
+        site_gone(at, layout.size());
         // SAFETY: the caller's contract, passed on.
         unsafe { std::alloc::System.dealloc(at, layout) };
     }
 
     unsafe fn realloc(&self, at: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
+        // Out of the samples before the block may go (back in below if it stays).
+        site_gone(at, layout.size());
         // SAFETY: the caller's contract, passed on.
         let moved = unsafe { std::alloc::System.realloc(at, layout, size) };
         if !moved.is_null() {
@@ -421,6 +593,9 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
             own(size, true);
             big(at, layout.size(), false);
             big(moved, size, true);
+            site_made(moved, size);
+        } else {
+            site_made(at, layout.size());
         }
         moved
     }
@@ -525,16 +700,26 @@ fn system_memory() -> (u64, u64) {
 }
 
 /// Whether the address space is walked for the memory map line
-/// ([`log_memory_map`]). On by default (this module is in diagnostics
-/// builds only); `VICTORY_MEMORY_MAP=0` leaves the walk out.
+/// ([`log_memory_map`]): only with `VICTORY_MEMORY_MAP=1`. Off by default
+/// because the walk holds up the whole process: with tens of thousands of
+/// title views it took 1 s at the start of play and close to 6 s six
+/// minutes in (RTX 5080 Laptop, 2026-11-27), every 30 s, and each of that
+/// day's three device resets (nvlddmkm 153) came 5 to 10 s after a walk
+/// began.
 fn memory_map() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_MEMORY_MAP").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MEMORY_MAP").is_some_and(|v| v == "1"))
 }
 
 /// Asks which of the pages in `asked` (address, answer) are in physical
-/// memory and adds the bytes each stands for (kind, bytes) to its kind.
-fn in_memory(asked: &mut Vec<[usize; 2]>, stands: &mut Vec<(usize, u64)>, present: &mut [u64; 10]) {
+/// memory and adds the bytes each stands for (kind, group, bytes) to its
+/// kind and to its group ([`NO_GROUP`]: none).
+fn in_memory(
+    asked: &mut Vec<[usize; 2]>,
+    stands: &mut Vec<(usize, u32, u64)>,
+    present: &mut [u64; 10],
+    groups: &mut [u64],
+) {
     use windows_sys::Win32::System::ProcessStatus::K32QueryWorkingSetEx;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     // SAFETY: our own process; `asked` holds that many entries of two
@@ -543,10 +728,13 @@ fn in_memory(asked: &mut Vec<[usize; 2]>, stands: &mut Vec<(usize, u64)>, presen
         K32QueryWorkingSetEx(GetCurrentProcess(), asked.as_mut_ptr().cast(), (asked.len() * 16) as u32)
     } != 0;
     if ok {
-        for (a, &(kind, bytes)) in asked.iter().zip(stands.iter()) {
+        for (a, &(kind, group, bytes)) in asked.iter().zip(stands.iter()) {
             // Bit 0 of the answer: the page is in the process's memory.
             if a[1] & 1 != 0 {
                 present[kind] += bytes;
+                if let Some(g) = groups.get_mut(group as usize) {
+                    *g += bytes;
+                }
             }
         }
     }
@@ -564,10 +752,11 @@ fn in_memory(asked: &mut Vec<[usize; 2]>, stands: &mut Vec<(usize, u64)>, presen
 /// (windows of title memory), 0.46 GB the pipeline library's file; mapped
 /// and so not private: 6.2 GB the title's page pool, 2.0 GB the driver's
 /// shader cache file.
-/// shortcut: the walk takes about 0.6 s on a thread of its own, and a
-/// query of a region of gigabytes holds up other threads' memory calls
-/// for its length (89 ms for the 6.2 GB pool), so it runs with every
-/// sixth memory line only.
+/// shortcut: the walk runs on a thread of its own with every sixth memory
+/// line only, but a query of a region of gigabytes holds up other threads'
+/// memory calls for its length (89 ms for the 6.2 GB pool), and the whole
+/// walk grew from about 0.6 s to 1 to 6 s as the title's views grew
+/// ([`memory_map`]: so it is asked for, not on by default).
 fn log_memory_map() {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_FREE, MEM_IMAGE, MEM_MAPPED, MEMORY_BASIC_INFORMATION, PAGE_WRITECOMBINE,
@@ -647,25 +836,75 @@ fn log_memory_map() {
             7
         }
     };
+    // Whose allocations are, where it can be told: mapped files by their
+    // names, buffers of ours the CPU maps by what the book says of them
+    // (`VICTORY_BOOK=1`), our own big blocks by their addresses; the rest
+    // of the write-combined memory is the driver's or the runtime's.
+    let ours = crate::book::cpu_ranges();
+    let bigs: Vec<(usize, usize)> = BIG_AT
+        .iter()
+        .zip(&BIG_BYTES)
+        .map(|(a, b)| (a.load(Relaxed), b.load(Relaxed) as usize))
+        .filter(|b| b.0 != 0)
+        .collect();
+    let mut names: Vec<String> = Vec::new();
+    let mut name_index: HashMap<String, u32> = HashMap::new();
+    let mut group_of: HashMap<usize, u32> = HashMap::new();
+    for r in regions.iter().filter(|r| r.3) {
+        let k = kind(r);
+        if !matches!(k, 5 | 6 | 8) || group_of.contains_key(&r.0) {
+            continue;
+        }
+        let end = r.0 + whole.get(&r.0).copied().unwrap_or(r.2);
+        let label = if k == 8 {
+            mapped_name(r.0)
+        } else {
+            let at = r.0 as u64;
+            let i = ours.partition_point(|o| o.0 <= at);
+            if i > 0 && at - ours[i - 1].0 < ours[i - 1].1.max(1) {
+                format!("ours: {}", ours[i - 1].2)
+            } else if let Some(o) = ours.get(i).filter(|o| (o.0 as usize) < end) {
+                format!("ours: {}", o.2)
+            } else if bigs.iter().any(|&(b, _)| b >= r.0 && b < end) {
+                "ours: Rust blocks of 32 MB and more".into()
+            } else if k == 5 {
+                "write-combined, not in the book (the driver's or the runtime's)".into()
+            } else {
+                "other private of 1 MB and more, not in the book".into()
+            }
+        };
+        let next = names.len() as u32;
+        let g = *name_index.entry(label.clone()).or_insert_with(|| {
+            names.push(label);
+            next
+        });
+        group_of.insert(r.0, g);
+    }
+    let mut group_committed = vec![0u64; names.len()];
+    let mut group_present = vec![0u64; names.len()];
     let mut committed = [0u64; 10];
     let mut present = [0u64; 10];
     let mut asked: Vec<[usize; 2]> = Vec::with_capacity(4096);
-    let mut stands: Vec<(usize, u64)> = Vec::with_capacity(4096);
+    let mut stands: Vec<(usize, u32, u64)> = Vec::with_capacity(4096);
     for r in regions.iter().filter(|r| r.3) {
         let k = kind(r);
         committed[k] += r.2 as u64;
+        let g = group_of.get(&r.0).copied().unwrap_or(NO_GROUP);
+        if let Some(c) = group_committed.get_mut(g as usize) {
+            *c += r.2 as u64;
+        }
         let mut offset = 0;
         while offset < r.2 {
             asked.push([r.1 + offset, 0]);
-            stands.push((k, STEP.min(r.2 - offset) as u64));
+            stands.push((k, g, STEP.min(r.2 - offset) as u64));
             if asked.len() == 4096 {
-                in_memory(&mut asked, &mut stands, &mut present);
+                in_memory(&mut asked, &mut stands, &mut present, &mut group_present);
             }
             offset += STEP;
         }
     }
     if !asked.is_empty() {
-        in_memory(&mut asked, &mut stands, &mut present);
+        in_memory(&mut asked, &mut stands, &mut present, &mut group_present);
     }
     let text: Vec<String> = (0..KINDS.len())
         .filter(|&k| committed[k] > 0)
@@ -715,6 +954,81 @@ fn log_memory_map() {
         groups.len(),
         biggest.join("; ")
     );
+    let mut whose: Vec<usize> = (0..names.len()).collect();
+    whose.sort_by_key(|&g| std::cmp::Reverse(group_present[g]));
+    let text: Vec<String> = whose
+        .iter()
+        .take(30)
+        .map(|&g| format!("{} {} MB ({} MB in memory)", names[g], group_committed[g] >> 20, group_present[g] >> 20))
+        .collect();
+    tracing::info!(
+        "memory map, whose (write-combined, other private of 1 MB and more, mapped at host addresses), \
+         most in memory first, {} of {}: {}",
+        text.len(),
+        names.len(),
+        text.join("; ")
+    );
+    log_heaps();
+    let (census, book) = crate::book::census();
+    if book[0] > 0 {
+        let text: Vec<String> = census
+            .iter()
+            .take(30)
+            .map(|(what, n, bytes)| format!("{what}: {n}, {} MB", bytes >> 20))
+            .collect();
+        tracing::info!(
+            "memory, the book (VICTORY_BOOK=1) by label, alive: {}; the book keeps {} entries alive and {} gone",
+            text.join("; "),
+            book[0],
+            book[1]
+        );
+    }
+    log_sites();
+}
+
+/// A group of [`log_memory_map`]'s that is none.
+const NO_GROUP: u32 = u32::MAX;
+
+/// The file mapped at `base` (its folder and name), or that it has none.
+fn mapped_name(base: usize) -> String {
+    use windows_sys::Win32::System::ProcessStatus::K32GetMappedFileNameW;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut name = [0u16; 1024];
+    // SAFETY: our own process and a buffer of that many characters.
+    let n = unsafe { K32GetMappedFileNameW(GetCurrentProcess(), base as *const _, name.as_mut_ptr(), name.len() as u32) }
+        as usize;
+    if n == 0 {
+        return "a section without a file".into();
+    }
+    let full = String::from_utf16_lossy(&name[..n.min(name.len())]);
+    let parts: Vec<&str> = full.rsplit('\\').take(2).collect();
+    format!("file {}", parts.into_iter().rev().collect::<Vec<_>>().join("\\"))
+}
+
+/// The process's heap as the system counts it: what is allocated in it and
+/// committed for it (ours, the runtime's and the driver's blocks under
+/// half a megabyte), and how many heaps there are. Only the process heap
+/// is asked: another may be one that is used unlocked.
+fn log_heaps() {
+    use windows_sys::Win32::System::Memory::{GetProcessHeap, GetProcessHeaps, HEAP_SUMMARY, HeapSummary};
+    // SAFETY: plain data.
+    let mut summary: HEAP_SUMMARY = unsafe { std::mem::zeroed() };
+    summary.cb = size_of::<HEAP_SUMMARY>() as u32;
+    // SAFETY: the process heap (always locked) and a sized structure.
+    let ok = unsafe { HeapSummary(GetProcessHeap(), 0, &mut summary) } != 0;
+    // SAFETY: asking the count only.
+    let heaps = unsafe { GetProcessHeaps(0, std::ptr::null_mut()) };
+    if ok {
+        tracing::info!(
+            "memory, the process heap: {} MB allocated, {} MB committed, {} MB reserved; {} heaps in the process; \
+             of ours under 1 MiB: {} MB",
+            summary.cbAllocated >> 20,
+            summary.cbCommitted >> 20,
+            summary.cbReserved >> 20,
+            heaps,
+            (owned(0) + owned(1) + owned(2)) >> 20
+        );
+    }
 }
 
 /// Logs where the memory is: the process and the PC, then what this crate
@@ -891,6 +1205,27 @@ fn log_memory() {
         own[6],
         mb(own[3]),
         own[7],
+    );
+    let pinned = crate::shadow::window_pinned();
+    tracing::info!(
+        "memory, windows outside buffers that only a descriptor slot keeps, unused for 30 s (what letting go of          copies stale slots keep would free): {} windows, {:.0} MB, {:.0} MB of their pages ever copied",
+        pinned[0],
+        mb(pinned[1]),
+        mb(pinned[2])
+    );
+    let slot_let_go = crate::shadow::SLOT_LET_GO.each_ref().map(|n| n.load(Relaxed));
+    tracing::info!(
+        "memory, copies only stale slots kept, let go (R1, VICTORY_SLOT_LET_GO), since the start: {} sweeps that found some,          {} title slots and {} free dynamic slots made null, {} copies no slot kept after (let go by the idle sweep), {:.0} MB; \
+         left: {} dynamic slots lists held, {} title slots read or made again meanwhile; the last sweep: {} copies looked for, {} slots found keeping them",
+        slot_let_go[0],
+        slot_let_go[1],
+        slot_let_go[4],
+        slot_let_go[2],
+        mb(slot_let_go[3]),
+        slot_let_go[5],
+        slot_let_go[6],
+        slot_let_go[7],
+        slot_let_go[8]
     );
     // Round 2: what the view table still holds and what goes around it,
     // what host lists cost, the card's share that is the layer's own or

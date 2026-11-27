@@ -66,13 +66,20 @@ $settings = @{
     # 12 threads for a submission's refreshes of host copies instead of a quarter of the processors (6 on 24):
     # Core Ultra 9 275HX, same view, refreshes 25 -> 19 ms (shadow.rs wide_threads)
     VICTORY_WIDE_THREADS = '12'
+    # Worker pools for 24 logical processors (as trustno1's launcher and AnyXboxX's profile size them) and the card's
+    # steps in placed order: slowest tenth of frames 112 -> 87 ms on a Core Ultra 9 275HX (median unchanged)
+    VICTORY_THIN_THREADS = '12'; VICTORY_UNDER_THREADS = '8'; VICTORY_LAND_THREADS = '8'; VICTORY_PLACED_ORDER = '1'
+    # A draw never waits for a pipeline still being made (was 500 ms a frame): it is left out for the moment, as
+    # XCL's stand-ins and cool_fox's launcher do. Worst 5 s window 2.8 s -> 0.5 s, none spent waiting (pipeline/make.rs)
+    VICTORY_PIPELINE_WAIT_MS = '0'
     # Shader writes into big write-combined copies stay on the card (-5 ms a frame)
     VICTORY_WC_NO_BACK = '1'; VICTORY_WC_NO_BACK_MIN_KB = '1024'
     # The title's page-mapping copies kept without Windows views (no cutscene freezes at scene cuts)
     VICTORY_SOFT_VIEWS = 'copies'
-    # Textures: pool with no blocks made ahead, 16 ms a pass, no catch-up, levels not on demand (sharp)
+    # Textures: pool with no blocks made ahead, 32 ms a pass (16 before: new vehicles stayed green while 6,000-18,000
+    # textures waited), no catch-up, levels not on demand (sharp)
     VICTORY_TEXTURE_POOL = '1'; VICTORY_RIPE_BLOCKS = '0'; VICTORY_TEXTURE_NO_WAIT = '1'; VICTORY_TEXTURE_CATCHUP = '0'
-    VICTORY_TEXTURE_STAGE_MS = '16'; VICTORY_LEVELS_ON_DEMAND = '0'
+    VICTORY_TEXTURE_STAGE_MS = '32'; VICTORY_LEVELS_ON_DEMAND = '0'
     VICTORY_PRELUDE_UPLOADS = '1'; VICTORY_SHOW_NEW_LATER = '1'; VICTORY_POOL_SMALL = '0'; VICTORY_TABLED_REREAD = '1'
     VICTORY_QUEUE_HOST_TEXTURES = '0'
     # Descriptor heaps' records
@@ -83,12 +90,14 @@ $settings = @{
     # The room's light is kept when the view turns into a dark corner: at least half of it, fading over 10 s
     # (ambient.rs memory; the room went black otherwise)
     VICTORY_AMBIENT_MEMORY = '0.5,10'
-    # 16 GB card with frame generation: idle textures go after 2.5 s only from 88 % of the card's budget, after 1 s
-    # from 93 % (was 75 % / 85 %: at 80-83 % every texture not seen for 2.5 s popped out and back in; host.rs)
-    VICTORY_TEXTURE_IDLE_PCT = '88,93'
-    # At most 256 idle host lists kept (512 before): each keeps the driver's command memory, 13 GB committed in all
-    # on a 32 GB PC that was paging it in and out (list.rs idle_most)
-    VICTORY_LIST_IDLE = '256'
+    # (Not set: VICTORY_SWEEP_LIMIT=200,8, the texture sweep bounded and big textures spared as Eden's cache does, held
+    # back the room new textures wait for: only 6 % of those let go came back, while the queue grew from 6-9k to
+    # 13-18k and "no room" went from 1 to 21. The sweep's counts are logged every 10 s either way: "texture sweep,
+    # last 10 s". VICTORY_TEXTURE_IDLE_PCT is only read with VICTORY_TEXTURE_KEEP=0/1.)
+    # (Not set: VICTORY_LIST_IDLE=256. Fewer idle host lists made the layer throw lists away and make them again:
+    # 3,324 made in five minutes, the private bytes 7 GB up while they were made, and their buffers made anew each
+    # time. The default, 512, stays. Buffers the CPU maps are given out again instead of made anew,
+    # VICTORY_BUFFER_REUSE, on by default: =0 turns it off; reuse.rs.)
     # Memory pressure (texture prefetch held to 64 MB a frame) from 0.75 GiB free, over from 1.5 GiB (was 3 and 5: on
     # a 32 GB PC it began a minute in and never ended, and textures popped in and out; residency.rs)
     VICTORY_PRESSURE_GIB = '0.75,1.5'
@@ -113,7 +122,9 @@ if ($Dlss -ne 'off') {
         # Frame generation takes 1.5 to 2 GB of the card's memory, which the layer otherwise fills with textures up
         # to nine tenths of its budget (on a 12 GB card it then ran out: no generated frames). On from the start, it
         # is left a fifth of the budget; ready but off, a little less is held back.
-        if ($settings.VICTORY_FRAMEGEN -eq '1') { $settings.VICTORY_TEXTURE_ROOM_PERCENT = if ($FrameGen) { '80' } else { '86' } }
+        # RTX5080Laptop branch, 16 GB: 88 % with it on (a twelfth of 16 GB is still 1.9 GB for it) and 90 % ready:
+        # at 80 % new textures waited for room ("no room" for 9,500 of them) and vehicles stayed green.
+        if ($settings.VICTORY_FRAMEGEN -eq '1') { $settings.VICTORY_TEXTURE_ROOM_PERCENT = if ($FrameGen) { '88' } else { '90' } }
     } else {
         Write-Host "No NVIDIA files in ${sl}: running without DLSS and frame generation. Get-NVIDIA-DLSS.cmd in the"
         Write-Host "repository folder fetches them from NVIDIA once (about 70 MB); VICTORY_STREAMLINE_DIR names another folder."

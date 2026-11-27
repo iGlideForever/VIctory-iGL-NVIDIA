@@ -24,6 +24,8 @@ static MISSES: AtomicU64 = AtomicU64::new(0);
 
 /// Keeps translated shaders in `dir` from now on.
 pub fn use_shader_cache(dir: PathBuf) {
+    #[cfg(windows)]
+    crate::pipeline::samplers::use_folder(dir.with_file_name("pipelines"));
     match Cache::open(dir) {
         Ok(cache) => {
             let _ = CACHE.set(cache);
@@ -129,11 +131,29 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
-    match CACHE.get() {
+    let translate = |c: &[u8]| {
+        let out = victory_shader::emit::translate(c).map_err(|e| e.to_string());
+        // Whether the water light's tile lists took a slot a lane (fxceless cd935520): said
+        // once for each translation of that program.
+        static TOLD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let [seen, rewritten] = victory_shader::emit::water_tile_slots_seen();
+        if seen > TOLD.swap(seen, Ordering::Relaxed) {
+            tracing::info!(
+                seen,
+                rewritten,
+                "the water light's tile-list program translated: rewritten to a slot a lane (VICTORY_WATER_TILE_SLOTS=0: not) when rewritten equals seen"
+            );
+        }
+        out
+    };
+    let shader = match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate),
         None => translate(container),
-    }
+    }?;
+    // Its static samplers into the list every process makes them from.
+    #[cfg(windows)]
+    crate::pipeline::samplers::know(&shader.static_samplers);
+    Ok(shader)
 }
 
 /// The cache entry's converter: the build and the container in, the

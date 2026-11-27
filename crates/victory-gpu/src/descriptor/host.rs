@@ -3581,6 +3581,68 @@ impl HostHeap {
         }
     }
 
+    /// The slots, the title's and the dynamic ones, whose host slot keeps
+    /// one of `buffers` (host resources by their raw pointer), with that
+    /// pointer ([`crate::shadow::let_go_slot_held`]); whether a slot is a
+    /// title slot: [`HostHeap::is_title_slot`]. A lock at a time, each for
+    /// a moment.
+    pub(crate) fn slots_keeping(&self, buffers: &std::collections::HashSet<usize>) -> Vec<(u32, usize)> {
+        use windows::core::Interface;
+        if self.sampler {
+            return Vec::new();
+        }
+        let mut found = Vec::new();
+        for (index, slot) in self.kept.iter().enumerate() {
+            let raw = slot.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, |r| r.as_raw() as usize);
+            if raw != 0 && buffers.contains(&raw) {
+                found.push((index as u32, raw));
+            }
+        }
+        found
+    }
+
+    /// Makes title slot `index` null, as a write of a view of nothing would,
+    /// if under its lock it still keeps the host resource `raw` and `still`
+    /// (asked under that lock) says so: the next draw that reads the slot
+    /// through a table makes it again from the title's record, and with it
+    /// a new host copy ([`HostHeap::mirror`]). Returns whether it let go.
+    pub(crate) fn let_go_slot(&self, index: u32, raw: usize, still: impl FnOnce() -> bool) -> bool {
+        use windows::core::Interface;
+        let kept_raw = |me: &Self| me.kept_in(index).map_or(0, |r| r.as_raw() as usize);
+        let _made = self.made.lock(index);
+        if kept_raw(self) != raw || self.made.get(index).unwrap_or(0) == 0 || !still() {
+            return false;
+        }
+        self.unmake(index);
+        kept_raw(self) == 0
+    }
+
+    /// Whether `index` is one of the title's slots (else a dynamic one).
+    pub(crate) fn is_title_slot(&self, index: u32) -> bool {
+        index < self.count
+    }
+
+    /// Dynamic slot `index`, if no list holds it ([`HostHeap::release`] gave
+    /// it back) and it still keeps the host resource `raw`, is made null and
+    /// lets go of it. A list that resets gives its slots back as they are,
+    /// each keeping what it viewed until another list takes it, which in a
+    /// ring of tens of thousands of slots may be never. Under the lock lists
+    /// take slots by, so none is taken meanwhile; no list reads a slot it
+    /// has not taken and made. `None`: not a dynamic slot; `Some(false)`: a
+    /// list holds it, or it keeps something else now.
+    pub(crate) fn let_go_free_dynamic(&self, index: u32, raw: usize) -> Option<bool> {
+        use windows::core::Interface;
+        let at = index.checked_sub(self.count)?;
+        let next = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        let free = next.1.get(at as usize).is_some_and(|taken| !*taken);
+        if !free || self.kept_in(index).map_or(0, |r| r.as_raw() as usize) != raw {
+            return Some(false);
+        }
+        self.make_null(index);
+        drop(next);
+        Some(true)
+    }
+
     /// What slot `index` views.
     fn kept_in(&self, index: u32) -> Option<ID3D12Resource> {
         self.kept.get(index as usize)?.lock().unwrap_or_else(|e| e.into_inner()).clone()

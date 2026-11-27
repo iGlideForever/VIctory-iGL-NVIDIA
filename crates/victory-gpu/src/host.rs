@@ -257,7 +257,7 @@ fn wait_resident() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAIT_RESIDENT").is_none_or(|v| v != "0"))
 }
 
-/// The flag memory is made with that [`resident`] waits for.
+/// The flag memory is made with that [`resident_at`] waits for.
 pub(crate) fn not_resident() -> D3D12_HEAP_FLAGS {
     if wait_resident() { D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT } else { D3D12_HEAP_FLAG_NONE }
 }
@@ -358,8 +358,37 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
 /// Times, microseconds and the longest of [`mapped`].
 static MAPPED: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
-/// New memory (made with [`not_resident`]) is resident when this returns.
-pub(crate) fn resident(device: &ID3D12Device, object: &impl Interface) -> windows::core::Result<()> {
+/// What new memory waited for by [`resident_at`] is: the index into
+/// [`RESIDENT_AT`] and [`RES_NAMES`].
+pub(crate) const RES_UPLOAD: usize = 0;
+pub(crate) const RES_SHARED: usize = 1;
+pub(crate) const RES_CARD_MAPPED: usize = 2;
+pub(crate) const RES_UAV: usize = 3;
+pub(crate) const RES_TWIN: usize = 4;
+pub(crate) const RES_POOL: usize = 5;
+pub(crate) const RES_HOST_TEXTURE: usize = 6;
+/// Made by `crate::ahead`'s thread, not by one a frame waits for.
+pub(crate) const RES_AHEAD: usize = 7;
+const RES_SOURCES: usize = 8;
+const RES_NAMES: [&str; RES_SOURCES] = [
+    "upload buffers",
+    "shared buffers",
+    "mapped card buffers",
+    "unordered-access buffers",
+    "depth twins",
+    "texture pool blocks",
+    "host textures",
+    "buffers made ahead",
+];
+
+/// By what it was made for: times, microseconds and the longest of
+/// [`resident_at`] since the start (every build).
+static RESIDENT_AT: [[std::sync::atomic::AtomicU64; 3]; RES_SOURCES] =
+    [const { [const { std::sync::atomic::AtomicU64::new(0) }; 3] }; RES_SOURCES];
+
+/// New memory (made with [`not_resident`]) is resident when this returns;
+/// the wait is counted by what the memory is for (`at`, a `RES_` index).
+pub(crate) fn resident_at(device: &ID3D12Device, object: &impl Interface, at: usize) -> windows::core::Result<()> {
     if !wait_resident() {
         return Ok(());
     }
@@ -371,20 +400,38 @@ pub(crate) fn resident(device: &ID3D12Device, object: &impl Interface) -> window
     RESIDENT[0].fetch_add(1, Ordering::Relaxed);
     RESIDENT[1].fetch_add(us, Ordering::Relaxed);
     RESIDENT[2].fetch_max(us, Ordering::Relaxed);
+    let site = &RESIDENT_AT[at.min(RES_SOURCES - 1)];
+    site[0].fetch_add(1, Ordering::Relaxed);
+    site[1].fetch_add(us, Ordering::Relaxed);
+    site[2].fetch_max(us, Ordering::Relaxed);
     static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = RESIDENT[0].load(Ordering::Relaxed);
     if n >= 1000 * (SAID.load(Ordering::Relaxed) + 1) {
         SAID.store(n / 1000, Ordering::Relaxed);
+        let by: Vec<String> = RES_NAMES
+            .iter()
+            .zip(&RESIDENT_AT)
+            .filter(|(_, s)| s[0].load(Ordering::Relaxed) > 0)
+            .map(|(name, s)| {
+                format!(
+                    "{name} {} times {:.1} ms (the longest {:.1} ms)",
+                    s[0].load(Ordering::Relaxed),
+                    s[1].load(Ordering::Relaxed) as f64 / 1000.0,
+                    s[2].load(Ordering::Relaxed) as f64 / 1000.0
+                )
+            })
+            .collect();
         tracing::info!(
-            "new memory waited for (VICTORY_WAIT_RESIDENT=0: not), since the start: {n} times, {:.1} ms, the longest {:.1} ms",
+            "new memory waited for (VICTORY_WAIT_RESIDENT=0: not), since the start: {n} times, {:.1} ms, the longest {:.1} ms; by what it is for: {}",
             RESIDENT[1].load(Ordering::Relaxed) as f64 / 1000.0,
-            RESIDENT[2].load(Ordering::Relaxed) as f64 / 1000.0
+            RESIDENT[2].load(Ordering::Relaxed) as f64 / 1000.0,
+            by.join(", ")
         );
     }
     made
 }
 
-/// Times, microseconds and the longest of [`resident`].
+/// Times, microseconds and the longest of [`resident_at`].
 static RESIDENT: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// Whether memory the card was given stays with it while there is room (on
@@ -478,11 +525,13 @@ fn sweep() {
     #[cfg(feature = "diagnostics")]
     crate::book::check();
     crate::residency::refresh();
+    crate::reuse::scan();
     if crate::residency::pressured() {
         trim_spare_chunks();
     }
     crate::pool::room(host().and_then(|h| h.video_memory()));
     crate::pipeline::trim_library();
+    crate::shadow::let_go_slot_held();
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
@@ -860,8 +909,8 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
 
 static HOST: OnceLock<Option<Host>> = OnceLock::new();
 
-/// The host GPU if it is made already.
-#[cfg(feature = "diagnostics")]
+/// The host GPU if it is made already (never makes it; in every build:
+/// `crate::pipeline::samplers` asks for it from translations).
 pub(crate) fn made_host() -> Option<&'static Host> {
     HOST.get()?.as_ref()
 }
@@ -945,6 +994,12 @@ fn create() -> windows::core::Result<Host> {
         // Before anything is made with it (`VICTORY_RECORD`).
         #[cfg(feature = "diagnostics")]
         crate::replay::record::from_env(&device);
+        // Before anything else has a static sampler (`pipeline::samplers`): the
+        // first thing made with the device, in the run as in the tools. Made
+        // after Streamline had the device (DLSS loaded, in the run only), the
+        // run drew a white-painted material black with the pipelines `victory
+        // warm` had compiled (foxhound launcher run rel4, 2026-11-27).
+        crate::pipeline::samplers::prime(&device);
         // `VICTORY_D3D12_BACKGROUND=0`: the runtime's background work (the
         // driver compiling shaders again on the "D3D Background Thread"s,
         // for minutes after pipelines were made or loaded) is switched off.
@@ -2007,7 +2062,9 @@ fn scratch_pool() -> bool {
 /// Things of some sizes that nothing holds now, kept for whoever next asks
 /// for one of the same size.
 struct Spare<T> {
-    kept: Vec<(T, u64)>,
+    /// The things, their sizes and since when they are kept ([`coarse_ms`]),
+    /// in the order given: the one given last at the end.
+    kept: Vec<(T, u64, u64)>,
     bytes: u64,
 }
 
@@ -2018,20 +2075,34 @@ impl<T> Spare<T> {
 
     /// A kept thing of `size` bytes, the one given last.
     fn take(&mut self, size: u64) -> Option<T> {
-        let at = self.kept.iter().rposition(|(_, s)| *s == size)?;
+        let at = self.kept.iter().rposition(|(_, s, _)| *s == size)?;
         self.bytes -= size;
         Some(self.kept.remove(at).0)
     }
 
-    /// Keeps `thing` (`size` bytes) unless that takes the kept bytes past
-    /// `most`: then it comes back.
-    fn give(&mut self, thing: T, size: u64, most: u64) -> Option<T> {
+    /// Keeps `thing` (`size` bytes, given at `now`) unless that takes the
+    /// kept bytes past `most`: then it comes back.
+    fn give(&mut self, thing: T, size: u64, most: u64, now: u64) -> Option<T> {
         if self.bytes + size > most {
             return Some(thing);
         }
         self.bytes += size;
-        self.kept.push((thing, size));
+        self.kept.push((thing, size, now));
         None
+    }
+
+    /// Takes out, with their sizes, the things kept for `idle` ms or longer
+    /// at `now` (with `idle` 0 all of them).
+    fn idle(&mut self, now: u64, idle: u64) -> Vec<(T, u64)> {
+        // Kept in the order given: the idle ones are the first.
+        let n = if idle == 0 {
+            self.kept.len()
+        } else {
+            self.kept.iter().position(|k| k.2 + idle > now).unwrap_or(self.kept.len())
+        };
+        let out: Vec<(T, u64)> = self.kept.drain(..n).map(|(thing, size, _)| (thing, size)).collect();
+        self.bytes -= out.iter().map(|(_, size)| *size).sum::<u64>();
+        out
     }
 }
 
@@ -2075,7 +2146,7 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
                 } else {
                     SPARE_MOST
                 };
-                spare.give(chunk, size, limit)
+                spare.give(chunk, size, limit, coarse_ms())
             } else {
                 Some(chunk)
             };
@@ -2096,16 +2167,19 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     drop(freed);
 }
 
-/// Drops spare scratch chunks kept idle when host memory is pressured.
+/// Under host memory pressure, once a second ([`sweep`]): drops the spare
+/// scratch chunks no list took for [`spare_idle_ms`].
 fn trim_spare_chunks() {
     let freed: Vec<(Chunk, u64)> = {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         if spare.kept.is_empty() {
             return;
         }
-        spare.bytes = 0;
-        std::mem::take(&mut spare.kept)
+        spare.idle(coarse_ms(), spare_idle_ms())
     };
+    if freed.is_empty() {
+        return;
+    }
     let count = freed.len() as u64;
     let bytes: u64 = freed.iter().map(|(_, s)| *s).sum();
     ALIVE[1].fetch_sub(count, Ordering::Relaxed);
@@ -2113,6 +2187,27 @@ fn trim_spare_chunks() {
     ALIVE[3].fetch_sub(count, Ordering::Relaxed);
     ALIVE[4].fetch_sub(bytes, Ordering::Relaxed);
     drop(freed);
+}
+
+/// How long a spare scratch chunk stays kept under host memory pressure
+/// while no list takes it (`VICTORY_SCRATCH_IDLE_MS=<ms>`, 5000 unless
+/// given; `0`: all of them are dropped once a second, as before).
+///
+/// On a 32 GB laptop (RTX 5080 Laptop, Core Ultra 9 275HX) pressure is on
+/// nearly all the time (under 1 GB of the PC's memory free), and dropping
+/// every spare chunk once a second gave nothing back: the lists took as
+/// many new ones within the second, each made resident while the system
+/// paged other memory out for it. Lists made about 4 chunks a second
+/// without pressure and 20 with it, and the waits for them were the
+/// longest of the run, up to 1.5 s (fork diag logs 111230 and 114236,
+/// 2026-11-27).
+fn spare_idle_ms() -> u64 {
+    static MS: OnceLock<u64> = OnceLock::new();
+    *MS.get_or_init(|| parse_idle_ms(std::env::var("VICTORY_SCRATCH_IDLE_MS").ok().as_deref()))
+}
+
+fn parse_idle_ms(set: Option<&str>) -> u64 {
+    set.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(5000).min(600_000)
 }
 
 /// What the host keeps for copies in the card's own memory
@@ -7938,6 +8033,12 @@ static SPLIT: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::A
 /// those known to copy nothing, and those done on several threads.
 static FLUSHES: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
+/// Since the last frame-rate line, of those flushes: nanoseconds checking
+/// on the submitting thread which refreshes copy nothing, nanoseconds of
+/// the refreshes on several threads (with the checks of large flushes),
+/// and the refreshes that were not known to copy nothing.
+static FLUSH_SPLIT: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
 /// Since the last frame-rate line, nanoseconds of the submitting thread
 /// around its submissions ([`Host::send_late`]): after one is sent, its
 /// flight noted in the line, what settled meanwhile and the landed lists
@@ -7996,6 +8097,15 @@ impl Split {
 fn submit_split_line(frames: f64) {
     let ms: [f64; 16] = std::array::from_fn(|i| SPLIT[i].swap(0, Ordering::Relaxed) as f64 / 1e6 / frames);
     let f: [f64; 4] = std::array::from_fn(|i| FLUSHES[i].swap(0, Ordering::Relaxed) as f64 / frames);
+    let flush: [f64; 3] = std::array::from_fn(|i| FLUSH_SPLIT[i].swap(0, Ordering::Relaxed) as f64 / frames);
+    if flush[1] > 0.0 {
+        tracing::info!(
+            "refreshes of copies per frame, the submitting thread's flushes: {:.2} ms checking one at a time which copy nothing,              {:.2} ms on several threads (the copying, and the checks of flushes of more than 256), {:.0} refreshes that copied",
+            flush[0] / 1e6,
+            flush[1] / 1e6,
+            flush[2]
+        );
+    }
     let after = AFTER_SEND.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames;
     let all: f64 = [0, 1, 2, 3, 4, 5, 11, 12, 13, 14, 15].iter().map(|&i| ms[i]).sum();
     if all + after <= 0.0 {
@@ -8590,9 +8700,11 @@ impl Batch {
         let mut spans = spans;
         let many = spans.len() > FEW;
         if !many {
+            let checking = std::time::Instant::now();
             let all = spans.len();
             spans.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
             FLUSHES[2].fetch_add((all - spans.len()) as u64, Ordering::Relaxed);
+            FLUSH_SPLIT[0].fetch_add(checking.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
         let ahead = spans.len() > 1;
         if ahead {
@@ -8600,6 +8712,7 @@ impl Batch {
             crate::watch::ask_ahead(&ranges);
         }
         FLUSHES[3].fetch_add(spans.len() as u64, Ordering::Relaxed);
+        let wide = std::time::Instant::now();
         crate::shadow::wide_each(spans.len() + due.len(), move |i| {
             // The textures first: they are the longer pieces.
             let Some(i) = i.checked_sub(due.len()) else {
@@ -8611,8 +8724,10 @@ impl Batch {
                 FLUSHES[2].fetch_add(1, Ordering::Relaxed);
                 return;
             }
+            FLUSH_SPLIT[2].fetch_add(1, Ordering::Relaxed);
             Self::update(shadow, *from, *to);
         });
+        FLUSH_SPLIT[1].fetch_add(wide.elapsed().as_nanos() as u64, Ordering::Relaxed);
         if ahead {
             crate::watch::ask_ahead_done();
         }
@@ -9175,7 +9290,15 @@ impl Host {
         }
     }
 
+    #[cfg_attr(feature = "diagnostics", track_caller)]
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        #[cfg(feature = "diagnostics")]
+        let caller = std::panic::Location::caller();
+        if let Some(given) = crate::reuse::take(crate::reuse::Kind::Upload, size) {
+            #[cfg(feature = "diagnostics")]
+            crate::book::made(&given.0, || format!("an upload buffer ({}, given out again)", crate::book::place(caller)));
+            return Some(given);
+        }
         MADE[0].fetch_add(1, Ordering::Relaxed);
         MADE[1].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
@@ -9210,7 +9333,7 @@ impl Host {
                 )
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    resident(&self.device, b)?;
+                    resident_at(&self.device, b, RES_UPLOAD)?;
                     b.Map(0, None, Some(&mut data))
                 })
         };
@@ -9218,10 +9341,17 @@ impl Host {
         if made.is_ok()
             && let Some(b) = &buffer
         {
-            crate::book::made(b, || "an upload buffer".into());
+            crate::book::made(b, || format!("an upload buffer ({})", crate::book::place(caller)));
+            crate::book::mapped(b, data);
         }
         match made {
-            Ok(()) => Some((buffer?, data.cast())),
+            Ok(()) => {
+                let buffer = buffer?;
+                crate::reuse::made(crate::reuse::Kind::Upload, size, &buffer, data.cast());
+                #[cfg(feature = "diagnostics")]
+                crate::reuse::note("upload", size, caller);
+                Some((buffer, data.cast()))
+            }
             Err(e) => {
                 crate::residency::allocation_error(&e);
                 tracing::warn!(error = %e, size, "no upload buffer");
@@ -10287,7 +10417,38 @@ impl Host {
     /// it is fast too) and shaders read and write: for host copies of title
     /// memory that shaders write, which upload memory cannot be. Starts in
     /// the common state (buffers move out of it implicitly).
+    #[cfg_attr(feature = "diagnostics", track_caller)]
     pub(crate) fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        #[cfg(feature = "diagnostics")]
+        let caller = std::panic::Location::caller();
+        if let Some(given) = crate::reuse::take(crate::reuse::Kind::Shared, size) {
+            #[cfg(feature = "diagnostics")]
+            crate::book::made(&given.0, || format!("a shared buffer ({}, given out again)", crate::book::place(caller)));
+            return Some(given);
+        }
+        // One made ahead, if it is of that size and one is in store (`crate::ahead`).
+        let ahead = if size == crate::ahead::SIZE { crate::ahead::shared() } else { None };
+        #[cfg(feature = "diagnostics")]
+        let fresh = ahead.is_none();
+        let (buffer, data) = match ahead {
+            Some(made) => made,
+            None => self.shared_buffer_now(size, RES_SHARED)?,
+        };
+        #[cfg(feature = "diagnostics")]
+        {
+            let how = if fresh { "" } else { ", made ahead" };
+            crate::book::made(&buffer, || format!("a shared buffer ({}{how})", crate::book::place(caller)));
+            if fresh {
+                crate::reuse::note("shared", size, caller);
+            }
+        }
+        crate::reuse::made(crate::reuse::Kind::Shared, size, &buffer, data);
+        Some((buffer, data))
+    }
+
+    /// [`Host::shared_buffer`] made now: not given out again, not one made
+    /// ahead; its wait for memory counted under `source` ([`RES_NAMES`]).
+    pub(crate) fn shared_buffer_now(&self, size: u64, source: usize) -> Option<(ID3D12Resource, *mut u8)> {
         MADE[2].fetch_add(1, Ordering::Relaxed);
         MADE[3].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
@@ -10325,7 +10486,7 @@ impl Host {
                 )
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    resident(&self.device, b)?;
+                    resident_at(&self.device, b, source)?;
                     mapped(&self.device)?;
                     b.Map(0, None, Some(&mut data))
                 })
@@ -10334,7 +10495,8 @@ impl Host {
         if made.is_ok()
             && let Some(b) = &buffer
         {
-            crate::book::made(b, || "a shared buffer".into());
+            crate::book::made(b, || "a shared buffer (made ahead, in store)".into());
+            crate::book::mapped(b, data);
         }
         match made {
             Ok(()) => Some((buffer?, data.cast())),
@@ -10371,7 +10533,16 @@ impl Host {
     /// A buffer in the card's own memory that the CPU maps, shaders read and
     /// (with `written`) may write. The CPU should only write it: a read of the
     /// mapping crosses the bus a few bytes at a time.
+    #[cfg_attr(feature = "diagnostics", track_caller)]
     pub(crate) fn mapped_card_buffer(&self, size: u64, written: bool) -> Option<(ID3D12Resource, *mut u8)> {
+        let kind = if written { crate::reuse::Kind::CardMappedWritten } else { crate::reuse::Kind::CardMapped };
+        #[cfg(feature = "diagnostics")]
+        let caller = std::panic::Location::caller();
+        if let Some(given) = crate::reuse::take(kind, size) {
+            #[cfg(feature = "diagnostics")]
+            crate::book::made(&given.0, || format!("a card buffer the CPU maps ({}, given out again)", crate::book::place(caller)));
+            return Some(given);
+        }
         if !self.mapped_card_memory() {
             return None;
         }
@@ -10414,13 +10585,26 @@ impl Host {
                 )
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    resident(&self.device, b)?;
+                    resident_at(&self.device, b, RES_CARD_MAPPED)?;
                     mapped(&self.device)?;
                     b.Map(0, None, Some(&mut data))
                 })
         };
+        #[cfg(feature = "diagnostics")]
+        if made.is_ok()
+            && let Some(b) = &buffer
+        {
+            crate::book::made(b, || format!("a card buffer the CPU maps ({})", crate::book::place(caller)));
+            crate::book::mapped(b, data);
+        }
         match made {
-            Ok(()) => Some((buffer?, data.cast())),
+            Ok(()) => {
+                let buffer = buffer?;
+                crate::reuse::made(kind, size, &buffer, data.cast());
+                #[cfg(feature = "diagnostics")]
+                crate::reuse::note("card mapped", size, caller);
+                Some((buffer, data.cast()))
+            }
             Err(e) => {
                 tracing::warn!(error = %e, size, "no buffer in card memory the CPU maps");
                 None
@@ -10430,7 +10614,26 @@ impl Host {
 
     /// A device-local buffer shaders may write (unordered access) and indirect
     /// execution may read, starting in the common state.
+    #[cfg_attr(feature = "diagnostics", track_caller)]
     pub(crate) fn uav_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        #[cfg(feature = "diagnostics")]
+        let caller = std::panic::Location::caller();
+        // One made ahead, if it is of that size and one is in store (`crate::ahead`).
+        if size == crate::ahead::SIZE
+            && let Some(made) = crate::ahead::card()
+        {
+            #[cfg(feature = "diagnostics")]
+            crate::book::made(&made, || format!("an unordered access buffer ({}, made ahead)", crate::book::place(caller)));
+            return Some(made);
+        }
+        #[cfg(feature = "diagnostics")]
+        crate::reuse::note("unordered access", size, caller);
+        self.uav_buffer_now(size, RES_UAV)
+    }
+
+    /// [`Host::uav_buffer`] made now, not one made ahead; its wait for
+    /// memory counted under `source` ([`RES_NAMES`]).
+    pub(crate) fn uav_buffer_now(&self, size: u64, source: usize) -> Option<ID3D12Resource> {
         MADE[4].fetch_add(1, Ordering::Relaxed);
         MADE[5].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
@@ -10467,7 +10670,7 @@ impl Host {
         if let Some(b) = &buffer {
             crate::book::made(b, || "an unordered access buffer".into());
         }
-        let made = made.and_then(|()| buffer.as_ref().map_or(Ok(()), |b| resident(&self.device, b))).and_then(|()| mapped(&self.device));
+        let made = made.and_then(|()| buffer.as_ref().map_or(Ok(()), |b| resident_at(&self.device, b, source))).and_then(|()| mapped(&self.device));
         match made {
             Ok(()) => buffer,
             Err(e) => {
@@ -10697,7 +10900,7 @@ mod trail {
 
 #[cfg(test)]
 mod spare {
-    use super::Spare;
+    use super::{Spare, parse_idle_ms};
 
     /// Kept things come back by size, the last given first, and nothing is
     /// kept past the limit.
@@ -10705,12 +10908,12 @@ mod spare {
     fn kept_things_come_back_by_size_within_the_limit() {
         let mut spare: Spare<u32> = Spare::new();
         assert_eq!(spare.take(4), None);
-        assert_eq!(spare.give(1, 4, 10), None);
-        assert_eq!(spare.give(2, 1, 10), None);
-        assert_eq!(spare.give(3, 4, 10), None);
+        assert_eq!(spare.give(1, 4, 10, 0), None);
+        assert_eq!(spare.give(2, 1, 10, 0), None);
+        assert_eq!(spare.give(3, 4, 10, 0), None);
         assert_eq!(spare.bytes, 9);
         // Past the limit: handed back, nothing changes.
-        assert_eq!(spare.give(4, 4, 10), Some(4));
+        assert_eq!(spare.give(4, 4, 10, 0), Some(4));
         assert_eq!(spare.bytes, 9);
         assert_eq!(spare.take(2), None, "no thing of that size");
         assert_eq!(spare.take(4), Some(3));
@@ -10719,6 +10922,34 @@ mod spare {
         assert_eq!(spare.take(1), Some(2));
         assert_eq!(spare.bytes, 0);
         assert!(spare.kept.is_empty());
+    }
+
+    /// Under memory pressure only what no one took for a while goes; one
+    /// taken and given again is kept anew.
+    #[test]
+    fn only_things_kept_idle_long_enough_go() {
+        let mut spare: Spare<u32> = Spare::new();
+        assert_eq!(spare.give(1, 4, 100, 1000), None);
+        assert_eq!(spare.give(2, 4, 100, 3000), None);
+        assert_eq!(spare.give(3, 1, 100, 5500), None);
+        assert_eq!(spare.take(4), Some(2));
+        assert_eq!(spare.give(2, 4, 100, 5800), None);
+        assert_eq!(spare.idle(6000, 5000), vec![(1, 4)]);
+        assert_eq!(spare.bytes, 5);
+        assert_eq!(spare.idle(6000, 5000), vec![]);
+        assert_eq!(spare.idle(11000, 5000), vec![(3, 1), (2, 4)]);
+        assert_eq!(spare.bytes, 0);
+        assert_eq!(spare.give(4, 4, 100, 12000), None);
+        assert_eq!(spare.idle(12000, 0), vec![(4, 4)], "0: all of them, as before");
+        assert_eq!(spare.bytes, 0);
+    }
+
+    #[test]
+    fn the_switch_reads_the_idle_time() {
+        assert_eq!(parse_idle_ms(None), 5000);
+        assert_eq!(parse_idle_ms(Some("0")), 0);
+        assert_eq!(parse_idle_ms(Some(" 2000 ")), 2000);
+        assert_eq!(parse_idle_ms(Some("soon")), 5000);
     }
 }
 

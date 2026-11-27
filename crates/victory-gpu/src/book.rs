@@ -15,7 +15,12 @@
 //!   slots name memory that is gone, while nothing is lost yet ([`check`]).
 //!
 //! The book is kept with device-removed data on (`VICTORY_D3D12_DRED`) or the
-//! check; `VICTORY_BOOK=0` keeps none.
+//! check, or with `VICTORY_BOOK=1` alone; `VICTORY_BOOK=0` keeps none.
+//!
+//! It also says whose memory is where ([`census`], [`cpu_ranges`]): buffers
+//! the CPU maps stand with their CPU address and the code that asked for
+//! them, so the memory map can tell our write-combined blocks from the
+//! driver's.
 //!
 //! What the descriptors' bits mean is AMD's (RDNA 2 and 3); on another card
 //! nothing is decoded as an address we know, and nothing is said.
@@ -44,6 +49,8 @@ struct Entry {
     made: u64,
     /// What was told of it since ([`note`]).
     notes: String,
+    /// Where the CPU maps it (0: nowhere known), [`mapped`].
+    cpu: u64,
 }
 
 #[derive(Default)]
@@ -74,9 +81,13 @@ pub(crate) fn on() -> bool {
     }
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var_os("VICTORY_BOOK").is_none_or(|v| v != "0")
-            && !cfg!(test)
-            && (crate::host::dred_any() || checks())
+        let set = std::env::var_os("VICTORY_BOOK");
+        !cfg!(test)
+            && match set.as_ref().and_then(|v| v.to_str()) {
+                Some("0") => false,
+                Some("1") => true,
+                _ => crate::host::dred_any() || checks(),
+            }
     })
 }
 
@@ -98,7 +109,7 @@ impl Book {
         if size > LONG {
             self.long.push(id);
         }
-        self.live.insert(id, Entry { start, size, what, made: now, notes: String::new() });
+        self.live.insert(id, Entry { start, size, what, made: now, notes: String::new(), cpu: 0 });
         if object != 0 {
             self.by_object.insert(object, id);
         }
@@ -344,6 +355,93 @@ pub(crate) fn made(resource: &ID3D12Resource, what: impl FnOnce() -> String) {
     watch(&object, id);
 }
 
+/// Where `resource` (in the book) is mapped for the CPU.
+pub(crate) fn mapped(resource: &ID3D12Resource, cpu: *mut c_void) {
+    if !on() || cpu.is_null() {
+        return;
+    }
+    let Ok(object) = resource.cast::<ID3D12Object>() else { return };
+    let raw = object.as_raw() as usize;
+    with(|b| {
+        if let Some(id) = b.by_object.get(&raw).copied()
+            && let Some(e) = b.live.get_mut(&id)
+        {
+            e.cpu = cpu as u64;
+        }
+    });
+}
+
+/// A caller's file and line, for a label: `texture.rs:2650`.
+pub(crate) fn place(at: &std::panic::Location<'_>) -> String {
+    let file = at.file().rsplit(['/', '\\']).next().unwrap_or(at.file());
+    format!("{file}:{}", at.line())
+}
+
+/// A label with its numbers taken out, so like things count together.
+fn kind_of(what: &str) -> String {
+    let mut out = String::with_capacity(what.len());
+    let mut chars = what.chars().peekable();
+    while let Some(c) = chars.next() {
+        let place_line = out.ends_with(".rs:");
+        if c.is_ascii_digit() && !place_line {
+            // A number, or a hexadecimal one after 0x.
+            if c == '0' && chars.peek() == Some(&'x') {
+                chars.next();
+                while chars.peek().is_some_and(|d| d.is_ascii_hexdigit()) {
+                    chars.next();
+                }
+            } else {
+                while chars.peek().is_some_and(|d| d.is_ascii_digit()) {
+                    chars.next();
+                }
+            }
+            out.push('#');
+        } else if c.is_ascii_digit() {
+            out.push(c);
+            while let Some(&d) = chars.peek().filter(|d| d.is_ascii_digit()) {
+                out.push(d);
+                chars.next();
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// What the book holds alive, by label (numbers taken out): count and
+/// bytes, most bytes first; and the book's own entries alive and gone.
+pub(crate) fn census() -> (Vec<(String, u64, u64)>, [u64; 2]) {
+    if !on() {
+        return (Vec::new(), [0, 0]);
+    }
+    let (kinds, sizes) = with(|b| {
+        let mut kinds: HashMap<String, (u64, u64)> = HashMap::new();
+        for e in b.live.values() {
+            let k = kinds.entry(kind_of(&e.what)).or_default();
+            k.0 += 1;
+            k.1 += e.size;
+        }
+        (kinds, [b.live.len() as u64, b.gone.len() as u64])
+    });
+    let mut kinds: Vec<(String, u64, u64)> = kinds.into_iter().map(|(k, (n, bytes))| (k, n, bytes)).collect();
+    kinds.sort_by_key(|k| std::cmp::Reverse(k.2));
+    (kinds, sizes)
+}
+
+/// The book's entries the CPU maps: CPU address, bytes and label (numbers
+/// taken out), by address.
+pub(crate) fn cpu_ranges() -> Vec<(u64, u64, String)> {
+    if !on() {
+        return Vec::new();
+    }
+    let mut ranges = with(|b| {
+        b.live.values().filter(|e| e.cpu != 0).map(|e| (e.cpu, e.size, kind_of(&e.what))).collect::<Vec<_>>()
+    });
+    ranges.sort_unstable_by_key(|r| r.0);
+    ranges
+}
+
 /// A block of texture memory, found by the texture `resource` at `offset` of it.
 pub(crate) fn block(heap: &ID3D12Heap, resource: &ID3D12Resource, offset: u64, bytes: u64) {
     if !on() {
@@ -419,6 +517,17 @@ pub(crate) enum Names {
     Nothing,
     Texture { base: u64, meta: Option<u64>, kind: u32, width: u32, height: u32 },
     Buffer { base: u64, stride: u32, bytes: u64 },
+}
+
+#[cfg(test)]
+mod kind_tests {
+    /// Numbers go, but a caller's line stays.
+    #[test]
+    fn labels_lose_their_numbers() {
+        assert_eq!(super::kind_of("an upload buffer (texture.rs:2650)"), "an upload buffer (texture.rs:2650)");
+        assert_eq!(super::kind_of("title buffer 0x1f00a at 12 of 3"), "title buffer # at # of #");
+        assert_eq!(super::kind_of("victory host list 17"), "victory host list #");
+    }
 }
 
 /// The descriptor `bytes` hold, as AMD's cards have them since RDNA 2.

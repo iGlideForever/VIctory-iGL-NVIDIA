@@ -216,6 +216,25 @@ fn mirror(handle: u64) {
     }
 }
 
+/// Calls `f` with each shader-visible view heap's host heap that is made
+/// (none is made here), under the lock that keeps heaps from going meanwhile
+/// (held shared: descriptor writes go on).
+#[cfg(windows)]
+pub(crate) fn each_host_view_heap(mut f: impl FnMut(&host::HostHeap)) {
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    for &(_, _, at) in heaps.iter() {
+        // SAFETY: registered heaps stay alive until `Heap::drop`, which takes
+        // the `SHADER_HEAPS` lock we hold here.
+        let heap = unsafe { &*(at as *const Heap) };
+        if heap.samplers() {
+            continue;
+        }
+        if let Some(Some(host)) = heap.host.get() {
+            f(host);
+        }
+    }
+}
+
 /// Whether [`sync_heaps`] is done (`VICTORY_HEAP_SYNC=0`: not).
 #[cfg(windows)]
 fn sync_on() -> bool {
