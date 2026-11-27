@@ -1,12 +1,51 @@
 # VIctory on NVIDIA
 
-> **Before you play**
->
-> - **F1 in the game brings up the settings menu** (arrow keys pick and
->   change, Enter does it). **F3 shows the stats panel** (frame rate, frame
->   generation, draws, GPU and memory numbers).
->
-> The steps are under [How to run it](#how-to-run-it).
+## Quick start: how to run it
+
+**The easy way: one file, nothing to build**
+
+1. Download `victory.exe` from the
+   [latest release](https://github.com/trustno1-coder/VIctory-NVIDIA/releases/latest).
+2. Put it into the folder of **your own dump** of the title's Xbox Series
+   build v1.0.2.1, next to `game_scarlett_master.exe`.
+3. Double-click it. Windows may say the publisher is unknown (the file is not
+   signed): "More info", then "Run anyway".
+
+- The first start asks once whether to download NVIDIA's DLSS and frame
+  generation files (about 70 MB) from NVIDIA's own GitHub. They are NVIDIA's
+  and are not part of this program; say no and the game still runs, with its
+  own upscaling and no frame generation.
+- Nothing is written into your game folder: settings, saves, caches, logs and
+  NVIDIA's files are kept under `%LOCALAPPDATA%\victory`.
+- You need Windows 10 or 11, 32 GB of RAM or more, an SSD and an NVIDIA
+  GeForce RTX card with a recent driver. This repository and its releases
+  contain no game files.
+
+**In the game**
+
+- **F1** brings up the settings menu (arrow keys pick and change, Enter does
+  it): DLSS, frame generation, frame rate cap and more.
+- **F3** shows the stats panel (frame rate, frame generation, draws, GPU and
+  memory numbers).
+
+**Building it yourself instead**
+
+Install [Rust](https://rustup.rs) and the
+[Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
+with "Desktop development with C++", then in PowerShell:
+
+```powershell
+git clone https://github.com/trustno1-coder/VIctory-NVIDIA
+cd VIctory-NVIDIA
+.\Get-NVIDIA-DLSS.cmd
+powershell -ExecutionPolicy Bypass -File scripts\play-nvidia.ps1 -Exe 'D:\Games\MyDump\game_scarlett_master.exe'
+```
+
+Put the path to **your** `game_scarlett_master.exe` in the last line. The
+first start builds the layer, which takes a few minutes.
+
+Options, requirements in full and the details are under
+[How to run it](#how-to-run-it).
 
 A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
 that runs an Xbox Series title natively on Windows from files **you** supply,
