@@ -16,6 +16,7 @@
 //! `present` (swap chain).
 
 #[cfg(windows)]
+mod ahead;
 mod ambient;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
@@ -73,8 +74,6 @@ pub mod replay;
 mod residency;
 #[cfg(windows)]
 mod reuse;
-#[cfg(windows)]
-mod ahead;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
