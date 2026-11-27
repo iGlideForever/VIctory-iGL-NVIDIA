@@ -309,6 +309,23 @@ static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::ne
 #[cfg(windows)]
 const IDLE_MOST: (usize, u64) = (512, 256 << 20);
 
+/// The most host lists kept idle: [`IDLE_MOST`]'s, or `VICTORY_LIST_IDLE=<n>`
+/// (32 to 4096). Each keeps the driver's memory for its commands over a reset,
+/// which is not counted in the upload memory above: on an RTX 5080 Laptop
+/// 1,495 host lists were alive and 13 GB of write-combined blocks (64 and
+/// 32 MB) committed, most of it paged out and paged in again as idle lists
+/// were taken, on a PC with 1 GB of RAM free (fork diag log, 2026-11-27).
+#[cfg(windows)]
+fn idle_most() -> usize {
+    static MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_LIST_IDLE")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map_or(IDLE_MOST.0, |n| n.clamp(32, 4096))
+    })
+}
+
 /// Whether host lists that have run are used again (on by default;
 /// `VICTORY_LIST_POOL=0`: each is made new and thrown away, as before).
 #[cfg(windows)]
@@ -348,7 +365,7 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
         drop(_uploads);
-        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
+        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= idle_most() {
             continue;
         }
         // As the title's reset does: what the list kept for its commands
@@ -356,7 +373,7 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         host.reset();
         let bytes = host.scratch_kept();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
+        if idle.0.len() < idle_most() && idle.1 + bytes <= IDLE_MOST.1 {
             idle.0.push(Idle(host, bytes));
             idle.1 += bytes;
         }

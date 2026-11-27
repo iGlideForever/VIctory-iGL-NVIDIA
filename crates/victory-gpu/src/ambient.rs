@@ -206,8 +206,33 @@ fn shade() -> [f32; 2] {
     })
 }
 
+/// `VICTORY_AMBIENT_MEMORY=<floor>[,<seconds>]`: the room's light is kept
+/// when the view turns away from it. The estimate takes what is on screen;
+/// facing a dark corner there is nothing lit to take, and the slow mean of
+/// the room followed that down in about a second (4% a frame): the room went
+/// black (RTX 5080 Laptop, play session 2026-11-27). With this the slow mean
+/// still rises as fast as before but falls with a half-life of `<seconds>`
+/// (10 if not given; frames counted at 20 a second), and no point gets less
+/// than `<floor>` (0 to 1) of it, shaded in creases as the rest. Unset or 0:
+/// as before.
+fn memory() -> [f32; 2] {
+    static SET: OnceLock<[f32; 2]> = OnceLock::new();
+    *SET.get_or_init(|| {
+        let set = std::env::var("VICTORY_AMBIENT_MEMORY").unwrap_or_default();
+        let mut parts = set.split(',').map(|t| t.trim().parse::<f32>().ok().filter(|v| v.is_finite()));
+        let floor = parts.next().flatten().map_or(0.0, |v| v.clamp(0.0, 1.0));
+        if floor == 0.0 {
+            return [0.0, 0.0];
+        }
+        let seconds = parts.next().flatten().filter(|v| *v > 0.0).unwrap_or(10.0);
+        // Per frame, at 20 frames a second: half of the way in `seconds`.
+        let follow_down = 1.0 - 0.5f32.powf(1.0 / (20.0 * seconds));
+        [floor, follow_down]
+    })
+}
+
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=12, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
+#define RS "RootConstants(num32BitConstants=14, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
@@ -217,6 +242,7 @@ cbuffer Set : register(b0) {
     float level; float constant; float strength; float radius;
     float near; float tan_y; uint width; uint height;
     float follow; float most; float air; float once;
+    float mem_floor; float follow_down;
 };
 Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
@@ -263,7 +289,9 @@ void mean() {
     for (uint i = 0; i < CELLS; i++) sum += cells[i].rgb;
     float4 was = cells[CELLS];
     float3 now = sum / CELLS;
-    cells[CELLS] = float4(was.a > 0.0 ? lerp(was.rgb, now, follow) : now, 1.0);
+    // Slower down than up (`memory`): turning into a dark corner keeps the room.
+    float f = follow_down > 0.0 && dot(now, LUMA) < dot(was.rgb, LUMA) ? follow_down : follow;
+    cells[CELLS] = float4(was.a > 0.0 ? lerp(was.rgb, now, f) : now, 1.0);
 }
 #endif
 
@@ -460,6 +488,8 @@ void raise(uint3 at : SV_DispatchThreadID) {
     found = all + 1.2 * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
     found = clamp(found, 0.2 * all, 2.5 * all);
     found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
+    // No darker than a share of the room's light (`memory`).
+    if (mem_floor > 0.0) found = max(found, cells[CELLS].rgb * mem_floor * level * open);
     float3 was = unpack(light[p]);
     // What the program left counts as far as it can be true: the sky's light
     // outdoors, not the blocks of other memory.
@@ -706,7 +736,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     list.keep(&pass.points);
     let [strength, radius] = shade();
     let floats = [level, constant, strength, radius, 0.1, 0.45];
-    let mut words = [0u32; 12];
+    let mut words = [0u32; 14];
     for (to, v) in words.iter_mut().zip(floats) {
         *to = v.to_bits();
     }
@@ -716,6 +746,9 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[9] = 4.0f32.to_bits();
     words[10] = air().to_bits();
     words[11] = if once() { 1.0f32 } else { 0.0 }.to_bits();
+    let [mem_floor, follow_down] = memory();
+    words[12] = mem_floor.to_bits();
+    words[13] = follow_down.to_bits();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
@@ -723,7 +756,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     unsafe {
         uav_barrier(l);
         l.SetComputeRootSignature(&pass.root);
-        l.SetComputeRoot32BitConstants(0, 12, words.as_ptr().cast(), 0);
+        l.SetComputeRoot32BitConstants(0, 14, words.as_ptr().cast(), 0);
         l.SetComputeRootDescriptorTable(1, views.depth);
         l.SetComputeRootDescriptorTable(2, views.image);
         l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
@@ -762,6 +795,24 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every program of the stand-in compiles as `make` compiles it (the
+    /// source is only compiled when the game runs otherwise).
+    #[test]
+    fn every_program_compiles() {
+        for (part, entry) in [
+            ("KEEP", s!("keep")),
+            ("KEEP", s!("mean")),
+            ("PLACE", s!("place")),
+            ("GATHER", s!("gather")),
+            ("RAISE", s!("raise")),
+            ("AIR", s!("clear_air")),
+            ("REFLECT", s!("reflect_light")),
+        ] {
+            let code = crate::host::compile(&format!("#define {part}\n{SOURCE}"), entry, s!("cs_5_1"));
+            assert!(code.is_ok(), "{part}: {code:?}");
+        }
+    }
 
     #[test]
     fn settings() {

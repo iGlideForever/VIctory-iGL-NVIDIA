@@ -188,10 +188,36 @@ pub(crate) fn vram_keep_below(budget: u64, used: u64, line: u64) -> (u64, u64) {
 pub(crate) fn vram_idle_ms(video_memory: Option<[u64; 4]>) -> u64 {
     static KEEP: OnceLock<bool> = OnceLock::new();
     let keep = *KEEP.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_KEEP").is_none_or(|v| v != "0"));
-    vram_idle_for(video_memory, keep)
+    vram_idle_with(video_memory, keep, vram_idle_pct())
+}
+
+/// The shares of the card's budget in use (percent) from which idle textures
+/// go after 2.5 s and after 1 s: `VICTORY_TEXTURE_IDLE_PCT=<moderate>,<high>`,
+/// 75,85 unless given. Below `moderate` they are kept 30 s (from 68 %) or
+/// 10 minutes ([`vram_idle_for`]).
+///
+/// On an RTX 5080 Laptop (16 GB) with DLSS frame generation the card sat at
+/// 80-83 % of a 13.9 GB budget for a whole session, so every texture not
+/// seen for 2.5 s went and was made again when the view came back to it:
+/// whole textures popping out and in (play session 2026-11-27, fork diag
+/// log). The thresholds were set on 12 GB cards.
+fn vram_idle_pct() -> [u128; 2] {
+    static SET: OnceLock<[u128; 2]> = OnceLock::new();
+    *SET.get_or_init(|| {
+        let set = std::env::var("VICTORY_TEXTURE_IDLE_PCT").unwrap_or_default();
+        let mut parts = set.split(',').map(|t| t.trim().parse::<u128>().ok().filter(|v| (1..=100).contains(v)));
+        match (parts.next().flatten(), parts.next().flatten()) {
+            (Some(moderate), Some(high)) if moderate <= high => [moderate, high],
+            _ => [75, 85],
+        }
+    })
 }
 
 fn vram_idle_for(video_memory: Option<[u64; 4]>, keep: bool) -> u64 {
+    vram_idle_with(video_memory, keep, [75, 85])
+}
+
+fn vram_idle_with(video_memory: Option<[u64; 4]>, keep: bool, [moderate, high]: [u128; 2]) -> u64 {
     const KEPT_MS: u64 = 600_000;
     const LONG_MS: u64 = 30_000;
     const NORMAL_MS: u64 = 5_000;
@@ -204,9 +230,9 @@ fn vram_idle_for(video_memory: Option<[u64; 4]>, keep: bool) -> u64 {
         return NORMAL_MS;
     }
     let used_pct = (u128::from(used) * 100) / u128::from(budget);
-    if used_pct >= 85 {
+    if used_pct >= high {
         HIGH_MS
-    } else if used_pct >= 75 {
+    } else if used_pct >= moderate {
         MODERATE_MS
     } else if !keep {
         NORMAL_MS
@@ -11448,6 +11474,19 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         // Missing or zero budget falls back to normal
         assert_eq!(vram_idle_ms(None), 5_000);
         assert_eq!(vram_idle_ms(Some([0, 100, 0, 0])), 5_000);
+    }
+
+    /// `VICTORY_TEXTURE_IDLE_PCT=88,93`: at 80-83 % of the budget textures are
+    /// kept 30 s, not 2.5 s; 88 % and 93 % take over the old 75 % and 85 %.
+    #[test]
+    fn vram_idle_thresholds_can_be_raised() {
+        let keeps = |used| super::vram_idle_with(Some([100, used, 0, 0]), true, [88, 93]);
+        assert_eq!(keeps(67), 600_000);
+        assert_eq!(keeps(83), 30_000);
+        assert_eq!(keeps(87), 30_000);
+        assert_eq!(keeps(88), 2_500);
+        assert_eq!(keeps(92), 2_500);
+        assert_eq!(keeps(93), 1_000);
     }
 
     #[test]

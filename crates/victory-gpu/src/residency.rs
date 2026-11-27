@@ -96,10 +96,38 @@ pub(crate) fn limited_host_ram() -> bool {
 }
 
 fn next_pressure(was: bool, physical: u64, commit: u64) -> bool {
+    next_pressure_with(was, physical, commit, [3 * GIB, 5 * GIB])
+}
+
+/// The free physical memory at which pressure begins and at which it ends:
+/// `VICTORY_PRESSURE_GIB=<begins>,<ends>` (GiB, decimals allowed), 3 and 5
+/// unless given. The commit limits stay (4 and 6 GiB).
+///
+/// On a 32 GB laptop (Core Ultra 9 275HX, RTX 5080 Laptop) the layer and
+/// the title hold 17-18 GB in memory and the PC 1-2 GB free: pressure began
+/// a minute into a session and never ended, so texture prefetch stayed at
+/// 64 MB a frame for the whole of it and textures came late, popping in and
+/// out (a memory cleaner that freed 5 GB stopped it until memory filled
+/// again; play sessions of 2026-11-27).
+fn pressure_gib() -> [u64; 2] {
+    static SET: OnceLock<[u64; 2]> = OnceLock::new();
+    *SET.get_or_init(|| {
+        let set = std::env::var("VICTORY_PRESSURE_GIB").unwrap_or_default();
+        let mut parts = set.split(',').map(|t| t.trim().parse::<f64>().ok().filter(|v| v.is_finite() && *v > 0.0));
+        match (parts.next().flatten(), parts.next().flatten()) {
+            (Some(begins), Some(ends)) if begins <= ends => {
+                [(begins * GIB as f64) as u64, (ends * GIB as f64) as u64]
+            }
+            _ => [3 * GIB, 5 * GIB],
+        }
+    })
+}
+
+fn next_pressure_with(was: bool, physical: u64, commit: u64, [begins, ends]: [u64; 2]) -> bool {
     if was {
-        physical < 5 * GIB || commit < 6 * GIB
+        physical < ends || commit < 6 * GIB
     } else {
-        physical <= 3 * GIB || commit <= 4 * GIB
+        physical <= begins || commit <= 4 * GIB
     }
 }
 
@@ -109,7 +137,7 @@ pub(crate) fn refresh() {
     let (physical, commit) = (status.ullAvailPhys, status.ullAvailPageFile);
     HEADROOM.store(physical.min(commit), Ordering::Relaxed);
     let was = pressured();
-    let pressure = next_pressure(was, physical, commit);
+    let pressure = next_pressure_with(was, physical, commit, pressure_gib());
     if pressure != was {
         PRESSURED.store(pressure, Ordering::Relaxed);
         if pressure {
@@ -185,6 +213,18 @@ mod tests {
         assert!(next_pressure(true, 6 * GIB, 5 * GIB));
         assert!(!next_pressure(true, 5 * GIB, 6 * GIB));
         assert!(!next_pressure(false, 4 * GIB, 5 * GIB));
+    }
+
+    /// `VICTORY_PRESSURE_GIB=0.75,1.5`: 1-2 GB free is no pressure; it begins
+    /// at 0.75 GiB and ends from 1.5 GiB. The commit limits are as before.
+    #[test]
+    fn the_physical_limits_can_be_lowered() {
+        let low = [3 * GIB / 4, 3 * GIB / 2];
+        assert!(!next_pressure_with(false, GIB, 16 * GIB, low));
+        assert!(next_pressure_with(false, 3 * GIB / 4, 16 * GIB, low));
+        assert!(next_pressure_with(true, GIB, 16 * GIB, low));
+        assert!(!next_pressure_with(true, 3 * GIB / 2, 16 * GIB, low));
+        assert!(next_pressure_with(false, 8 * GIB, 4 * GIB, low));
     }
 
     #[test]

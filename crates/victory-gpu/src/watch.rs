@@ -1752,6 +1752,47 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     opened: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
 });
 
+/// How long a thread that finds the guards' lock taken tries for it awake
+/// before it sleeps (`VICTORY_GUARDS_SPIN=<microseconds>`, 50 unless given;
+/// `0`: not at all, as before).
+///
+/// The lock is held 1 to 20 us at a time, yet with every core busy a thread
+/// put to sleep for it is woken some 100 us after it is free: on a Core
+/// Ultra 9 275HX (RTX 5080 Laptop) 1,100 takings a frame waited 120 ms for
+/// it, all threads. Trying again awake for a little while gets it as soon as
+/// it is free: 120 to 47 ms a frame there. The lock is the same lock, taken
+/// the same way: only the wait for it changes.
+fn guards_spin() -> std::time::Duration {
+    static US: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    std::time::Duration::from_micros(*US.get_or_init(|| {
+        std::env::var("VICTORY_GUARDS_SPIN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(50)
+    }))
+}
+
+/// The guards' lock, taken: awake for [`guards_spin`] at most, then asleep.
+fn guards_lock() -> std::sync::MutexGuard<'static, Guards> {
+    let most = guards_spin();
+    if !most.is_zero() {
+        let began = std::time::Instant::now();
+        loop {
+            // About a microsecond between tries, so that the tries do not
+            // keep the lock's line from its holder.
+            for _ in 0..32 {
+                std::hint::spin_loop();
+            }
+            match GUARDS.try_lock() {
+                Ok(g) => return g,
+                Err(std::sync::TryLockError::Poisoned(e)) => return e.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {}
+            }
+            if began.elapsed() >= most {
+                break;
+            }
+        }
+    }
+    GUARDS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// The guards' lock, with what faults opened without it settled first
 /// ([`settle`]).
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
@@ -1759,7 +1800,7 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
         Ok(g) => g,
         // (Held by this, whoever panicked with it: not to be asked for again.)
         Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
-        Err(std::sync::TryLockError::WouldBlock) => waited(3, || GUARDS.lock().unwrap_or_else(|e| e.into_inner())),
+        Err(std::sync::TryLockError::WouldBlock) => waited(3, guards_lock),
     };
     settle(&mut g);
     g

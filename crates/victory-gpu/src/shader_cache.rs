@@ -76,6 +76,8 @@ fn build() -> [u8; 32] {
             "VICTORY_MESH_OUTPUT_STRICT",
             "VICTORY_BVH_FENCES",
             "VICTORY_BVH_BOUNDS",
+            // Node tests that miss without a read (emit/intersect.rs).
+            "VICTORY_BVH_MISS",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');

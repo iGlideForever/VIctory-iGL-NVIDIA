@@ -63,6 +63,9 @@ $settings = @{
     VICTORY_CARD_REHASH_RUNS = '1'; VICTORY_JOIN_COPIES = '1'; VICTORY_CARD_STEPS = '2'; VICTORY_CARD_AWAKE = '1'
     VICTORY_CARD_BUFFERS_MIN_KB = '64'; VICTORY_INDIRECT_WINDOW = '1'; VICTORY_INDIRECT_BATCH = '2'
     VICTORY_UPLOAD_AHEAD = '1'; VICTORY_SHOW_AFTER = '1'; VICTORY_MAP_THREADS = '1'
+    # 12 threads for a submission's refreshes of host copies instead of a quarter of the processors (6 on 24):
+    # Core Ultra 9 275HX, same view, refreshes 25 -> 19 ms (shadow.rs wide_threads)
+    VICTORY_WIDE_THREADS = '12'
     # Shader writes into big write-combined copies stay on the card (-5 ms a frame)
     VICTORY_WC_NO_BACK = '1'; VICTORY_WC_NO_BACK_MIN_KB = '1024'
     # The title's page-mapping copies kept without Windows views (no cutscene freezes at scene cuts)
@@ -77,6 +80,18 @@ $settings = @{
     VICTORY_HEAP_SYNC_AT_SUBMIT = '1'
     # Light without the title's ray tracing: an estimate of indirect light and of reflections
     VICTORY_AMBIENT = '0.8'; VICTORY_AMBIENT_AIR = '1.5'; VICTORY_AMBIENT_SPECULAR = '1'
+    # The room's light is kept when the view turns into a dark corner: at least half of it, fading over 10 s
+    # (ambient.rs memory; the room went black otherwise)
+    VICTORY_AMBIENT_MEMORY = '0.5,10'
+    # 16 GB card with frame generation: idle textures go after 2.5 s only from 88 % of the card's budget, after 1 s
+    # from 93 % (was 75 % / 85 %: at 80-83 % every texture not seen for 2.5 s popped out and back in; host.rs)
+    VICTORY_TEXTURE_IDLE_PCT = '88,93'
+    # At most 256 idle host lists kept (512 before): each keeps the driver's command memory, 13 GB committed in all
+    # on a 32 GB PC that was paging it in and out (list.rs idle_most)
+    VICTORY_LIST_IDLE = '256'
+    # Memory pressure (texture prefetch held to 64 MB a frame) from 0.75 GiB free, over from 1.5 GiB (was 3 and 5: on
+    # a 32 GB PC it began a minute in and never ended, and textures popped in and out; residency.rs)
+    VICTORY_PRESSURE_GIB = '0.75,1.5'
     # Pixel programs keep the console's early depth test
     VICTORY_EARLY_DEPTH = '1'
     # Left out: the decal heap's defragmentation (5.6 ms of GPU a frame) and the heat-haze pass (smeared blocks)
@@ -110,6 +125,14 @@ foreach ($k in $menu.Keys) {
     if ($menu[$k]) { $settings[$k] = $menu[$k] } else { $settings.Remove($k) }
 }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
+# With the title's ray tracing off (the default): its light probes are activated and every ray misses at its
+# first node without reading the never-built structure (emit/intersect.rs VICTORY_BVH_MISS). The probes then no
+# longer keep stale memory, which showed as violet bushes, trees, palms and blinds at night (cause found by
+# Op-lite/victory-scarlett, VICTORY_PROBE_RAYS). -More @{VICTORY_ACTIVATE_RAYS='0'} brings the old picture back.
+if ($settings.VICTORY_BVH_BUILDER -ne '1') {
+    if (-not $settings.Contains('VICTORY_ACTIVATE_RAYS')) { $settings.VICTORY_ACTIVATE_RAYS = '1' }
+    if ($settings.VICTORY_ACTIVATE_RAYS -eq '1') { $settings.VICTORY_BVH_MISS = '1' }
+}
 $console = if ($SeriesS) { 'series-s' } else { 'series-x' }
 # For the menu: what it shows as the current choices, where it saves, and how it starts the game again
 # (-More is not carried over a restart from the menu).

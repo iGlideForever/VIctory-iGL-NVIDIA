@@ -1,2 +1,7 @@
 [alias]
 xtask = "run --quiet --package xtask --"
+
+# Local tuning: build for this PC's own CPU (AVX2 and newer are used where the
+# compiler can). The binary then runs only on a CPU like this one.
+[build]
+rustflags = ["-C", "target-cpu=native"]
