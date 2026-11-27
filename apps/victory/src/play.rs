@@ -91,6 +91,10 @@ const SETTINGS: &[(&str, &str)] = &[
     ("VICTORY_SPANS_QUICK", "1"),
     ("VICTORY_SYNC_FINE", "1"),
     ("VICTORY_HEAP_SYNC_AT_SUBMIT", "1"),
+    // Texture pieces are placed as before (first block that fits), not fullest block first: that
+    // would change how often an empty block is given back to the card, which has not been counted
+    // yet. The gate (no new block past the line) is on either way.
+    ("VICTORY_POOL_FULLEST", "0"),
     // Light without the title's ray tracing
     ("VICTORY_AMBIENT", "0.8"),
     ("VICTORY_AMBIENT_AIR", "1.5"),
