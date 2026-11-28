@@ -94,9 +94,43 @@ fn water_light_left_out(shaders: &[Arc<Shader>]) -> bool {
         && shaders.iter().any(|s| WATER_LIGHT.contains(&s.hash.as_str()))
 }
 
+/// The title's compute programs that skin, deform or unpack geometry for the ray-tracing
+/// structures only, by container hash (the 41 programs of that library in its shader archive).
+/// What they write is read by the structure builder's stages and by nothing else a frame runs:
+/// every draw and dispatch naming their output buffers was one of them (measured by
+/// ZigZagBoi1/ScarlettPort, perf/bvh-input-skip 6795fe4c, GPL-3.0-or-later, 2026-11-27).
+const BVH_INPUTS: [&str; 41] = [
+    "023439f44041b689", "1a77e876755eff12", "207bf7d2f14a87e6", "2cb480030989538a", "3cf39f4495b908d0",
+    "409e2cddc90b6d0d", "4518151afe8c6c09", "60b09004fef7f2f1", "64fe9fa3cb71d57f", "6b39336022e5e663",
+    "71ab19b0a4669299", "75bd00da58a1615c", "77edaab306206e9a", "81dc252c4d183e30", "822e62ded676ef45",
+    "827b309e779552d7", "82a2ad6d07417d36", "878933b499cfa14d", "8f9eb68d0c6dd5cf", "904e7a51e3fab26c",
+    "90a0692af4320129", "952fd529dd779b27", "96d1ef386a0ddcfb", "9db486cee396e315", "9ffcaff533995118",
+    "a567b9ef845fb680", "aff8936db59182b7", "b5a672a450b321e2", "b8e420aac4197681", "c7213dc64c67638b",
+    "c7aef9c89f12051f", "c968414adaaeb93d", "ca2c77616107b128", "cb90a66c7fe122aa", "cd34b8dd52ee5c0c",
+    "ced45910ad577dcb", "d28b4922384831fe", "d3022ba8427bc72c", "dd24ff46af3ae6ee", "e06a21f3cea46973",
+    "f16876929fa64f9f",
+];
+
+/// `VICTORY_BVH_INPUT_SKIP`: pipelines of a [`BVH_INPUTS`] program are left out (never made,
+/// their dispatches dropped) while the structure builder does not run, which is unless
+/// `VICTORY_BVH_BUILDER=1`: what they write would only be read by the builder. On by default,
+/// `0` runs them. ScarlettPort, RTX 3060, three A/B runs: 45-90 dispatches a frame dropped, the
+/// median frame 124-135 -> 74-82 ms (7.9 -> 13.5 fps), the same draws, screenshots of both the
+/// same and characters still animated (the card's time, not gaps: it stayed 96% busy).
+fn bvh_input_left_out(shaders: &[Arc<Shader>]) -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_BVH_INPUT_SKIP").is_none_or(|v| v != "0")
+            && std::env::var_os("VICTORY_BVH_BUILDER").is_none_or(|v| v != "1")
+    }) && shaders.iter().any(|s| s.stage == "compute" && BVH_INPUTS.contains(&s.hash.as_str()))
+}
+
 fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     if !leave_out().is_empty() && shaders.iter().any(|s| leave_out().contains(&s.hash)) {
         return Some("named in VICTORY_LEAVE_OUT, left out");
+    }
+    if bvh_input_left_out(shaders) {
+        return Some("makes input for the ray-tracing structure builder, which is off (VICTORY_BVH_INPUT_SKIP=0 runs it)");
     }
     if water_light_left_out(shaders) {
         return Some("the water's tiled light on a host of 32-lane waves, left out (VICTORY_WATER_LIGHT=0)");
@@ -619,6 +653,19 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The ray-tracing input programs are named as shader hashes are written: 16 lowercase
+    /// hex digits, each once.
+    #[test]
+    fn bvh_input_hashes_are_shader_hashes_each_once() {
+        for h in BVH_INPUTS {
+            assert!(h.len() == 16 && h.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)), "{h}");
+        }
+        let mut sorted = BVH_INPUTS.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), BVH_INPUTS.len());
+    }
 
     #[test]
     fn worker_count_follows_the_processors_and_the_switch() {
