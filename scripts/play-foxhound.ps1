@@ -93,6 +93,10 @@ $settings = @{
     VICTORY_TEXTURE_STAGE_MS = '32'; VICTORY_LEVELS_ON_DEMAND = '0'
     VICTORY_PRELUDE_UPLOADS = '1'; VICTORY_SHOW_NEW_LATER = '1'; VICTORY_POOL_SMALL = '0'; VICTORY_TABLED_REREAD = '1'
     VICTORY_QUEUE_HOST_TEXTURES = '0'
+    # Textures past their five looks again (about 30 s after the upload) are looked at every 120 frames, after every
+    # other texture due, so one the title rewrites later with nothing to tell (green vehicles) is noticed; El1xr #115
+    # (descriptor/host.rs recheck_tail). The F1 menu's LATE TEXTURE LOOKS changes or ends it
+    VICTORY_RECHECK_TAIL = '120'
     # Descriptor heaps' records
     VICTORY_HEAP_SYNC_FIRST = '1'; VICTORY_SYNC_IN_PLACE = '1'; VICTORY_SPANS_QUICK = '1'; VICTORY_SYNC_FINE = '1'
     VICTORY_HEAP_SYNC_AT_SUBMIT = '1'

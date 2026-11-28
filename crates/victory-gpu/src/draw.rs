@@ -840,10 +840,31 @@ pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 /// Frames after a whole upload of a texture picked by index at which its
 /// memory is looked at again, each counted from the look before.
 const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
+const _: () = assert!(RECHECK_FRAMES.len() == crate::descriptor::host::RECHECK_TAIL_LOOKS as usize);
 
 /// Looks at uploaded textures picked by index that found the memory as it
 /// was, and that found it changed (uploaded again), since the start.
 pub(crate) static HEAP_TEXTURES_RECHECKED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// Looks of the recheck tail (`VICTORY_RECHECK_TAIL`,
+/// [`crate::descriptor::host::recheck_tail`]) that found a texture as it was, and that found
+/// it changed, since the start; and the frame of the next line that says so.
+static RECHECK_TAIL: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
+/// A look of the recheck tail in `frame`, which found its texture `changed` or not; every
+/// 600 frames or so, a line with the counts since the start.
+fn recheck_tail_look(frame: u64, changed: bool) {
+    RECHECK_TAIL[usize::from(changed)].fetch_add(1, Ordering::Relaxed);
+    let next = RECHECK_TAIL[2].load(Ordering::Relaxed);
+    if frame >= next && RECHECK_TAIL[2].compare_exchange(next, frame + 600, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+        tracing::info!(
+            every = crate::descriptor::host::recheck_tail().unwrap_or(0),
+            unchanged = RECHECK_TAIL[0].load(Ordering::Relaxed),
+            changed = RECHECK_TAIL[1].load(Ordering::Relaxed),
+            "recheck tail (VICTORY_RECHECK_TAIL), looks since the start at textures past their looks"
+        );
+    }
+}
 
 /// Uploads of textures already on the card made while it had no room for
 /// new ones, since the start.
@@ -3277,12 +3298,27 @@ impl State {
             };
             if let Some((at, len, print, looks, uploaded)) = checked {
                 let looked = timed(0, || crate::texture::fingerprint(at, len));
+                let tail_look = looks >= crate::descriptor::host::RECHECK_TAIL_LOOKS;
+                if tail_look {
+                    recheck_tail_look(frame, looked != print);
+                }
                 if looked == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
                     outcome(slot_outcome::UNCHANGED);
+                    // Past the last look: left, or looked at every so often with
+                    // `VICTORY_RECHECK_TAIL` (`RECHECK_TAIL_LOOKS` marks those looks).
                     tells.tell(index, write, match RECHECK_FRAMES.get(usize::from(looks) + 1) {
                         Some(wait) => Told::Recheck(frame + wait, (at, len), print, looks + 1, uploaded),
-                        None => Told::Done(None),
+                        None => match crate::descriptor::host::recheck_tail() {
+                            Some(every) => Told::Recheck(
+                                frame + every,
+                                (at, len),
+                                print,
+                                crate::descriptor::host::RECHECK_TAIL_LOOKS,
+                                uploaded,
+                            ),
+                            None => Told::Done(None),
+                        },
                     });
                     continue;
                 }
@@ -3306,6 +3342,7 @@ impl State {
                         bytes = len,
                         frames_after_upload = frame.saturating_sub(uploaded),
                         looks,
+                        tail_look,
                         changed = n + 1,
                         "a texture picked by index changed after its upload with nothing to tell of it: uploaded again"
                     );

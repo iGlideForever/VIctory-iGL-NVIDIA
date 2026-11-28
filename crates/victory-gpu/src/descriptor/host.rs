@@ -1290,7 +1290,13 @@ impl TextureQueue {
                 if w.looks > 0 || w.mapped > 0 {
                     // (Only these can wait for a look again: `recheck`
                     // leaves a look, `partly` some bytes mapped.)
-                    due.again.push((w.written, index, w.write, Some(w.checked).filter(|c| c.2 != 0)));
+                    let checked = Some(w.checked).filter(|c| c.2 != 0);
+                    if checked.is_some_and(|c| c.3 >= RECHECK_TAIL_LOOKS) {
+                        // A look of the recheck tail: by the frame it was due from.
+                        due.tail.push((w.due, index, w.write, checked));
+                    } else {
+                        due.again.push((w.written, index, w.write, checked));
+                    }
                 } else {
                     due.fresh.push((w.written, index, w.write));
                 }
@@ -1304,6 +1310,31 @@ impl TextureQueue {
 /// memory is (address, bytes), its fingerprint, the looks that found it
 /// unchanged, the frame of the upload.
 pub(crate) type Checked = (u64, u64, u64, u8, u64);
+
+/// The looks a slot of the recheck tail ([`recheck_tail`]) has noted: one past the last of
+/// `crate::draw`'s `RECHECK_FRAMES` (whose wait after it is none), so that the look after a
+/// tail look is one again.
+pub(crate) const RECHECK_TAIL_LOOKS: u8 = 5;
+
+/// `VICTORY_RECHECK_TAIL=N` (frames, 1-10000; off by default). A slot uploaded whole is looked
+/// at again after 4, 12, 40, 120 and 400 frames, some 30 s at the world's frame rate, and then
+/// leaves the looks for good: a texture the title fills in place only later, with no
+/// descriptor written and nothing mapped, keeps the picture of the last look for the rest of
+/// the run (the title rewrites about 200 textures a run "with nothing to tell", and vehicles
+/// stay green; kylepelham/El1xr #115 found a phone screen that stays black). With the switch,
+/// the slot is looked at every `N` frames after the last look instead, for as long as its
+/// view stays (a write of the slot or of its memory takes it out); a change found there
+/// uploads it again as any look's does. These looks are served after every other slot due
+/// ([`Due::ordered`]), in the room a pass has left, so that new textures never wait behind
+/// them (the queue serves looks again first). From El1xr b95add5b (GPL-3.0).
+pub(crate) fn recheck_tail() -> Option<u64> {
+    static EVERY: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *EVERY.get_or_init(|| recheck_tail_frames(std::env::var("VICTORY_RECHECK_TAIL").ok().as_deref()))
+}
+
+fn recheck_tail_frames(value: Option<&str>) -> Option<u64> {
+    value.and_then(|v| v.trim().parse::<u64>().ok()).filter(|n| (1..=10_000).contains(n))
+}
 
 /// What the pass over textures picked by index found of a slot it took, as
 /// told to the queue ([`HostHeap::texture_slots_told`]).
@@ -1328,6 +1359,9 @@ pub(crate) enum Told {
 struct Due {
     again: Vec<(u64, u32, u64, Option<Checked>)>,
     fresh: Vec<(u64, u32, u64)>,
+    /// Looks of the recheck tail ([`recheck_tail`]): (frame due from, slot, write number,
+    /// what was checked).
+    tail: Vec<(u64, u32, u64, Option<Checked>)>,
 }
 
 impl Due {
@@ -1340,7 +1374,7 @@ impl Due {
     /// [`Due::order`], and beside it what [`TextureQueue::checked`] said of
     /// each when they were taken.
     fn ordered(self, max: usize) -> (Vec<(u32, u64)>, Vec<Option<Checked>>) {
-        let Due { mut again, mut fresh } = self;
+        let Due { mut again, mut fresh, mut tail } = self;
         // By the number of the write, counted over the run.
         again.sort_unstable_by(|a, b| b.2.cmp(&a.2));
         fresh.sort_unstable_by(|a, b| b.2.cmp(&a.2));
@@ -1357,6 +1391,13 @@ impl Due {
         }
         order.truncate(max);
         known.resize(order.len(), None);
+        // Last, the recheck tail's looks in what room is left, the longest due first, so that a
+        // pass cut short by its time takes the others' turn next.
+        tail.sort_unstable_by_key(|t| t.0);
+        for &(_, index, write, checked) in tail.iter().take(max.saturating_sub(order.len())) {
+            order.push((index, write));
+            known.push(checked);
+        }
         (order, known)
     }
 }
@@ -5739,6 +5780,44 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_recheck_tail_takes_frames_between_looks() {
+        assert_eq!(recheck_tail_frames(None), None);
+        assert_eq!(recheck_tail_frames(Some("")), None);
+        assert_eq!(recheck_tail_frames(Some("0")), None);
+        assert_eq!(recheck_tail_frames(Some("x")), None);
+        assert_eq!(recheck_tail_frames(Some(" 120 ")), Some(120));
+        assert_eq!(recheck_tail_frames(Some("10000")), Some(10_000));
+        assert_eq!(recheck_tail_frames(Some("10001")), None);
+    }
+
+    /// Looks of the recheck tail come after every other slot due, in what room is left, the
+    /// longest due first, each with what was checked of it; a look of the back-off still
+    /// comes first of all.
+    #[test]
+    fn recheck_tail_looks_come_last_in_the_room_left() {
+        let mut q = TextureQueue::default();
+        for i in 1..=4u32 {
+            q.written(i, 1, 0, false);
+        }
+        let write = |q: &TextureQueue, index: u32| q.due(u64::MAX, 100).iter().find(|d| d.0 == index).unwrap().1;
+        let (w1, w2, w3) = (write(&q, 1), write(&q, 2), write(&q, 3));
+        // Slots 1 and 2 in the tail (due from frames 20 and 10), slot 3 at a look of the
+        // back-off, slot 4 never served.
+        q.recheck(1, w1, 20, (0x1000, 4096), 7, RECHECK_TAIL_LOOKS, 2);
+        q.recheck(2, w2, 10, (0x2000, 4096), 7, RECHECK_TAIL_LOOKS, 2);
+        q.recheck(3, w3, 5, (0x3000, 4096), 7, 1, 2);
+        let order = |max: usize| q.due(30, max).iter().map(|d| d.0).collect::<Vec<u32>>();
+        assert_eq!(order(100), [3, 4, 2, 1]);
+        assert_eq!(order(3), [3, 4, 2]);
+        assert_eq!(order(2), [3, 4]);
+        let (order, known) = q.due_and_census(30).0.ordered(100);
+        assert_eq!(order.len(), known.len());
+        assert_eq!(known.iter().map(|k| k.map(|c| c.0)).collect::<Vec<_>>(), [Some(0x3000), None, Some(0x2000), Some(0x1000)]);
+        // Not due yet: not handed out.
+        assert_eq!(q.due(15, 100).iter().map(|d| d.0).collect::<Vec<u32>>(), [3, 4, 2]);
+    }
 
     fn rr(size: u64, offset: u64, len: u64) -> (Option<(u64, u32)>, Option<Cut>) {
         let (range, cut) = raw_range(size, offset, len);
