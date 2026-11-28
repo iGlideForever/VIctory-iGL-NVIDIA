@@ -128,6 +128,9 @@ $settings = @{
     # Not set: VICTORY_ATOMIC_SUB_LOOP=1 (F1 menu, WEATHER PARTICLES) gives weatherParticle's CS_BeginUpdate
     # (7f61193d2c0e5f22) the pipeline the RTX 50 driver refuses otherwise; it cost 5-8 ms a frame (run 203556)
     # for nothing seen in play, so it stays off.
+    # The pool's gate (on unless VICTORY_POOL_GATE=0) makes no new 64 MB texture block past the texture line; pieces
+    # still go in the first block that fits, as the gate's own launcher keeps it (pool.rs; fullest-first is untested)
+    VICTORY_POOL_FULLEST = '0'
     # Left out: the decal heap's defragmentation (5.6 ms of GPU a frame) and the heat-haze pass (smeared blocks)
     VICTORY_LEAVE_OUT = '02384a60fda6f2d0,731a39171b568298'
     # Pipelines the title makes are written down, so `victory warm` can make them ahead
