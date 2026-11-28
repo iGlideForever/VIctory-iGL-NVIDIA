@@ -122,6 +122,9 @@ $settings = @{
     # VICTORY_LDS_FIRST_INIT) stays off for now, so the merge is measured against the runs before it. The F1 menu's
     # WATER LIGHT turns it on: its ON saves an empty value, which unsets this (pipeline/make.rs)
     VICTORY_WATER_LIGHT = '0'
+    # Atomic subtractions on group memory as compare-exchange loops: the RTX 50 driver refuses such a compute
+    # pipeline as out of memory (0x8007000E); weatherParticle's CS_BeginUpdate (7f61193d2c0e5f22) was dropped
+    VICTORY_ATOMIC_SUB_LOOP = '1'
     # Left out: the decal heap's defragmentation (5.6 ms of GPU a frame) and the heat-haze pass (smeared blocks)
     VICTORY_LEAVE_OUT = '02384a60fda6f2d0,731a39171b568298'
     # Pipelines the title makes are written down, so `victory warm` can make them ahead

@@ -101,6 +101,12 @@ fn build() -> [u8; 32] {
             bytes.extend_from_slice(b"VICTORY_EARLY_DEPTH=1");
             bytes.push(0);
         }
+        // And whether atomic subtractions are compare-exchange loops
+        // (`VICTORY_ATOMIC_SUB_LOOP=1`), only while on.
+        if victory_shader::emit::atomic_sub_loops() {
+            bytes.extend_from_slice(b"VICTORY_ATOMIC_SUB_LOOP=1");
+            bytes.push(0);
+        }
         // And which clean-up passes ran over the translated code.
         bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
         bytes

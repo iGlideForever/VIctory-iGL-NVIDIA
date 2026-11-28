@@ -129,6 +129,15 @@ pub use shader::{
     raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
 
+/// Whether group-shared atomic subtractions use compare-exchange loops.
+/// Off unless `VICTORY_ATOMIC_SUB_LOOP=1`. Some NVIDIA drivers refuse
+/// compute pipelines containing these subtractions. The shader cache
+/// keys on the setting.
+pub fn atomic_sub_loops() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ATOMIC_SUB_LOOP").is_some_and(|v| v == "1"))
+}
+
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 
