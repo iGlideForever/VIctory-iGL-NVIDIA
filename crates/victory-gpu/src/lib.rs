@@ -75,6 +75,7 @@ mod residency;
 #[cfg(windows)]
 mod reuse;
 pub mod resource;
+pub mod save_share;
 pub mod root;
 #[cfg(windows)]
 mod safecopy;
