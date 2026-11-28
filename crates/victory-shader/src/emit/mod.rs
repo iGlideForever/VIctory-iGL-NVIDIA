@@ -780,7 +780,7 @@ pub fn emit(
         other => other,
     };
     let supported = |(shader, wave): (HostShader, Option<u32>)| {
-        if wave == Some(64) && lower::host_max_wave() == 32 {
+        if too_wide(wave) {
             Err(ShaderError::Unsupported {
                 offset: 0,
                 what: "no wave32 lowering for this wave64 program",
@@ -921,6 +921,12 @@ fn widen(
     }
 }
 
+/// Whether a translation asks for wider waves than the host's: 64 lanes on a host of
+/// 32-lane waves, which [`emit`] refuses.
+fn too_wide(wave: Option<u32>) -> bool {
+    wave == Some(64) && lower::host_max_wave() == 32
+}
+
 /// The translated program, and the wave size it requires of the host.
 /// Which programs get the branches that close or leave their loops taken by each host wave
 /// together where cross-lane code depends on the wave ([`emit_program`]):
@@ -941,7 +947,13 @@ fn loops_wave(native: &NativeProgram) -> bool {
 /// [`emit_program_plain`]; a program that comes out depending on the host's waves is
 /// translated once more with the per-lane branches that close or leave its loops taken by
 /// each host wave together ([`structure::structure_wide_host`]), and that translation is the
-/// one given if it needs no wider waves.
+/// one given if it needs no wider waves and the host has waves that wide ([`too_wide`]).
+/// One that still asks for 64 lanes on a host of 32 is no better than the first, and the
+/// first keeps the blocks its lowering named ([`lower::take_needs`]), around which
+/// [`widen`] takes the per-lane branches wave-wide: taken with the retry, `widen` saw none,
+/// stopped at waves of 64 and the program was refused (likely issue #539: from 64d4931 on,
+/// a compute program bound in dives no longer translates, "no wave32 lowering for this
+/// wave64 program", and the scene under water is not drawn).
 ///
 /// Why: the lowering turns the console's wave loops into loops each lane leaves on its own,
 /// and takes the code behind a loop as code the whole wave runs together. On NVIDIA the lanes
@@ -977,7 +989,7 @@ fn emit_program(
     });
     let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
     match again {
-        Ok((shader, Some(w))) if w <= *wave => {
+        Ok((shader, Some(w))) if w <= *wave && !too_wide(Some(w)) => {
             if why {
                 eprintln!("WAVE-LOOPS {} loop branches taken by each host wave together", loops.len());
             }
