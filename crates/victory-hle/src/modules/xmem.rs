@@ -1000,7 +1000,7 @@ pub(crate) fn pages_written(pages: &[usize], offset: usize, len: usize) {
     }
     for (at, bytes) in shown_at(pages, offset, len) {
         if stream_notice() {
-            victory_gpu::kernel_will_write(at, bytes);
+            victory_gpu::title_page_view_written(at, bytes);
         } else {
             victory_gpu::title_memory_written(at, bytes, true);
         }

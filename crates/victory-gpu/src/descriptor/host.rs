@@ -966,6 +966,80 @@ pub(crate) fn remapped(at: usize, len: usize) {
     ranges.push((start, end));
 }
 
+/// `VICTORY_ALIAS_WRITES` (on by default; `0`: as before). The title shows the
+/// same physical pages at several addresses, and a texture's view may be at
+/// one while a file read or a copy of ours writes through another: the slot
+/// was not told, kept the picture from before, and was found changed only by
+/// a look again ("changed after its upload with nothing to tell of it": in
+/// run 182903, 124 of the 200 logged had their blocks shown elsewhere), or
+/// never once its looks were over. With it, such a write tells the same bytes
+/// of every other view of those pages too ([`memory_written`]), and a copy of
+/// ours tells them after its bytes are there (`crate::watch::copying_to_title`).
+/// (Writes of the title's own, which the guards see, told them already.)
+/// From TaynanGT/Vice-Tay 03ecd2f and fbfdd3e (GPL-3.0).
+pub(crate) fn alias_writes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ALIAS_WRITES").is_none_or(|v| v != "0"))
+}
+
+/// Since the start: writes [`memory_written`] told at other views too, and the
+/// ranges it told there.
+pub(crate) static ALIAS_WRITES: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// The kernel or a copy of ours writes title memory `[at, at + len)`: as
+/// [`remapped`], and with [`alias_writes`] the same bytes at every other view
+/// of those pages are told as well. The views are looked up before the
+/// ranges' lock is taken (`crate::inplace::written_aliases`, under its read
+/// lock).
+pub(crate) fn memory_written(at: usize, len: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    remapped(at, len);
+    if len == 0 || !alias_writes() || SPANNED[0].load(Relaxed) == u64::MAX {
+        return;
+    }
+    let aliases = crate::inplace::written_aliases(at, len);
+    if aliases.is_empty() {
+        return;
+    }
+    ALIAS_WRITES[0].fetch_add(1, Relaxed);
+    ALIAS_WRITES[1].fetch_add(aliases.len() as u64, Relaxed);
+    for (other, bytes) in aliases {
+        remapped(other, bytes);
+    }
+}
+
+/// Every 600 frames or so, with [`alias_writes`]: what [`memory_written`] told
+/// at other views since the start.
+fn alias_writes_line(frame: u64) {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let next = NEXT.load(Relaxed);
+    if alias_writes() && frame >= next && NEXT.compare_exchange(next, frame + 600, Relaxed, Relaxed).is_ok() {
+        tracing::info!(
+            writes = ALIAS_WRITES[0].load(Relaxed),
+            ranges = ALIAS_WRITES[1].load(Relaxed),
+            "writes told at the other views of their pages too, since the start (VICTORY_ALIAS_WRITES)"
+        );
+    }
+}
+
+/// Said once: a second view heap took the ranges [`remapped`] keeps. They are
+/// kept in one place, and the heap whose pass runs first takes them, so the
+/// other heap's slots there are not told (Vice-Tay #371 keeps them for each
+/// heap; not ported while one heap takes them).
+fn heap_taking_notes(id: u64) {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+    static FIRST: AtomicU64 = AtomicU64::new(u64::MAX);
+    static SAID: AtomicBool = AtomicBool::new(false);
+    let first = match FIRST.compare_exchange(u64::MAX, id, Relaxed, Relaxed) {
+        Ok(_) => id,
+        Err(first) => first,
+    };
+    if first != id && !SAID.swap(true, Relaxed) {
+        tracing::warn!(first, second = id, "a second view heap takes the notes of memory mapped and written: each heap's own would be wanted");
+    }
+}
+
 /// Ranges of memory, those that touch made one (DexNom/VIctory 921d8d3b:
 /// several threads map and write, some 5,000 ranges a frame, the same
 /// textures' over and over, and each was looked up).
@@ -2526,10 +2600,12 @@ impl HostHeap {
     pub(crate) fn texture_slots_remapped(&self, frame: u64) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
         self.texture_slots_page_written(frame);
+        alias_writes_line(frame);
         let mut ranges = std::mem::take(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner()));
         if ranges.is_empty() {
             return 0;
         }
+        heap_taking_notes(self.id);
         join(&mut ranges);
         let mut slots: Vec<u32> = {
             let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());

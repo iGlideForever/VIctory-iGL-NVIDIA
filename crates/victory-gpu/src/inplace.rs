@@ -409,6 +409,43 @@ pub(crate) fn shown_elsewhere(start: usize, end: usize) -> Vec<(usize, Vec<usize
     out
 }
 
+/// The bytes a write of `[start, start + len)` through one view changes at
+/// other addresses: the same bytes of each other view of those pages, as
+/// `(address, bytes)` ranges, pages shown in very many views included (a
+/// texture there changes all the same). From TaynanGT/Vice-Tay 03ecd2f
+/// (GPL-3.0).
+pub(crate) fn written_aliases(start: usize, len: usize) -> Vec<(usize, usize)> {
+    let v = views();
+    let end = start.saturating_add(len);
+    let mut out = Vec::new();
+    if start >= end || v.pages_twice == 0 {
+        return out;
+    }
+    let first = v.views.range(..=start).next_back().filter(|(base, view)| start - *base < view.0).map_or(start, |(&base, _)| base);
+    for (&base, &(bytes, section, offset)) in v.views.range(first..end) {
+        let from = start.max(base);
+        let to = end.min(base.saturating_add(bytes));
+        let first_page = base + (from - base) / K64 * K64;
+        for page in (first_page..to).step_by(K64) {
+            let Some(shown) = v.pages.get(&(section, offset + (page - base) as u64)) else {
+                continue;
+            };
+            let lo = from.saturating_sub(page);
+            let hi = (to - page).min(K64);
+            for &alias in shown.iter().filter(|&&alias| alias != page) {
+                let Some((&other, &(other_bytes, ..))) = v.views.range(..=alias).next_back() else {
+                    continue;
+                };
+                let (a, b) = (alias.saturating_add(lo), alias.saturating_add(hi).min(other.saturating_add(other_bytes)));
+                if a < b {
+                    out.push((a, b - a));
+                }
+            }
+        }
+    }
+    out
+}
+
 /// The address of the 64 KiB page shown at `page` in every title view that
 /// shows it, `page`'s own address included; empty if `page` is not a view.
 pub(crate) fn pages_of(page: usize) -> Vec<usize> {
@@ -1312,6 +1349,27 @@ pub(crate) fn tick() {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// A write through one view names the same bytes of every other view of
+    /// those pages, cut to that view, and nothing of a page shown once
+    /// (Vice-Tay 03ecd2f).
+    #[test]
+    fn a_write_through_one_view_names_the_same_bytes_at_the_others() {
+        const K64: usize = 64 << 10;
+        // Addresses nothing has: only the record is asked.
+        let (a, b) = (0x7ff2_0000_0000_usize, 0x7ff2_1000_0000_usize);
+        let section = 0x5eed_0a11;
+        // Two pages of the section at `a`; the first of them again at `b`.
+        super::title_memory_view(a, 2 * K64, section, 0);
+        super::title_memory_view(b, K64, section, 0);
+        assert_eq!(written_aliases(a + 17, 3), [(b + 17, 3)]);
+        assert_eq!(written_aliases(b + 100, 50), [(a + 100, 50)]);
+        assert_eq!(written_aliases(a + K64 - 8, 16), [(b + K64 - 8, 8)]);
+        assert!(written_aliases(a + K64 + 8, 16).is_empty());
+        super::views_gone(a, 2 * K64);
+        super::views_gone(b, K64);
+        assert!(written_aliases(a + 17, 3).is_empty());
+    }
 
     /// Views as the runtime tells them: a range inside one view, or over
     /// views that continue each other in one section, is one run; over

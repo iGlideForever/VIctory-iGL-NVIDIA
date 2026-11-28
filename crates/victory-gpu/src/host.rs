@@ -9285,12 +9285,14 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     if ask_first && !crate::texture::committed(dst, len) {
         return;
     }
-    if title_dst {
-        // The kernel writes the destination: it must not be guarded, and it
-        // must be a mapping of the host's.
+    // The kernel writes the destination: it must not be guarded, and it must
+    // be a mapping of the host's. The placed textures there, and at the other
+    // views of those pages, are told when this is dropped, after the copy
+    // (`crate::watch::copying_to_title`).
+    let _copying = title_dst.then(|| {
         crate::watch::materialize(dst as usize, len);
-        crate::watch::writing(dst as usize, len);
-    }
+        crate::watch::copying_to_title(dst as usize, len)
+    });
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
     let since = crate::watch::changes();
