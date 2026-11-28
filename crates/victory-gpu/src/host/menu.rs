@@ -50,6 +50,16 @@ const ABOUT_PRELOAD: [&str; 3] = [
     "TAKES A WHILE: MAYBE A LONG TIME, DEPENDING ON HARDWARE.",
     "A LATER UPDATE OF THIS BUILD MAY NEED A NEW PRELOAD.",
 ];
+/// What a setting does, shown in the `ABOUT` lines while its line is picked
+/// (the menu's font: capitals, digits and ./-><*:_=()+,!? only).
+const ITEM_ABOUT: &[(&str, [&str; 3])] = &[(
+    "VICTORY_ATOMIC_SUB_LOOP",
+    [
+        "RUNS THE WEATHER PARTICLE UPDATE THE RTX 50 DRIVER REFUSES.",
+        "ON: 5-8 MS MORE A FRAME, ABOUT 2-3 FPS LESS NEAR 20 FPS.",
+        "OFF: THAT TIME SAVED. NO DIFFERENCE SEEN IN PLAY SO FAR.",
+    ],
+)];
 /// The note after the first Enter on it: the second one does it.
 const CONFIRM_PRELOAD: &str = "ENTER AGAIN: SAVE, CLOSE THE GAME AND PRELOAD";
 /// The last line of the box: where this build comes from.
@@ -99,6 +109,9 @@ const ITEMS: &[Item] = &[
     // On unless "0": a file saved by an earlier version holds an empty value (its OFF) or "1",
     // and both start it on, so nobody keeps it off from before by accident (2026-11-27).
     Item { var: "VICTORY_WATER_LIGHT", label: "WATER LIGHT", values: &[("", "ON"), ("0", "OFF")], live: false },
+    // weatherParticle's CS_BeginUpdate, which the RTX 50 driver refuses unless its atomic
+    // subtractions are compare-exchange loops (emit::atomic_sub_loops): about 5-8 ms a frame.
+    Item { var: "VICTORY_ATOMIC_SUB_LOOP", label: "WEATHER PARTICLES", values: &[("", "OFF (FASTER)"), ("1", "ON (SLOWER)")], live: false },
     Item { var: "VICTORY_LEAVE_OUT", label: "HEAT HAZE AND DECAL DEFRAG", values: &[("02384a60fda6f2d0,731a39171b568298", "LEFT OUT"), ("", "RUN (SLOWER, SMEARS)")], live: false },
     Item { var: "VICTORY_EARLY_DEPTH", label: "EARLY DEPTH TEST", values: ON_UNSET, live: false },
     Item { var: "VICTORY_WC_NO_BACK", label: "SKIP BIG COPY-BACKS", values: ON_UNSET, live: false },
@@ -229,6 +242,12 @@ fn fps_line() -> Option<String> {
 
 /// The index of `value` among the item's values (an unknown value: shown as
 /// itself, at the end).
+/// The `ABOUT` lines of the setting on line `at`, if it has any ([`ITEM_ABOUT`]).
+fn item_about(at: usize) -> Option<[&'static str; 3]> {
+    let item = ITEMS.get(at)?;
+    ITEM_ABOUT.iter().find(|(var, _)| *var == item.var).map(|(_, about)| *about)
+}
+
 fn index_of(item: &Item, value: &str) -> Option<usize> {
     item.values.iter().position(|(v, _)| *v == value)
 }
@@ -419,7 +438,7 @@ impl Menu {
             out.push(String::new());
         }
         out.push(String::new());
-        let about = if self.at == ITEMS.len() + PRELOAD { ABOUT_PRELOAD } else { [""; 3] };
+        let about = if self.at == ITEMS.len() + PRELOAD { ABOUT_PRELOAD } else { item_about(self.at).unwrap_or([""; 3]) };
         out.extend(about.iter().map(|l| (*l).to_owned()));
         out.push(if self.note.is_empty() { "* = CHANGED: APPLIES AT THE NEXT START UNLESS LIVE".to_owned() } else { self.note.clone() });
         out.push(REPO.to_owned());
@@ -776,10 +795,13 @@ mod tests {
                 let n = lines.len();
                 assert!(lines[n - 2].starts_with("* = CHANGED") || lines[n - 2] == note, "{}", lines[n - 2]);
                 assert_eq!(lines[n - 1], REPO);
-                // What a preload costs is said while it is picked, and only then.
+                // What a preload costs, or what a setting does, is said while it is picked,
+                // and only then.
                 let about = &lines[n - 5..n - 2];
                 if at == ITEMS.len() + PRELOAD {
                     assert_eq!(about, ABOUT_PRELOAD);
+                } else if let Some(said) = item_about(at) {
+                    assert_eq!(about, said);
                 } else {
                     assert!(about.iter().all(String::is_empty), "{about:?}");
                 }
@@ -787,6 +809,15 @@ mod tests {
         }
         assert_eq!(ACTIONS[PRELOAD], "PRELOAD SHADERS (RESTARTS THE GAME)");
         assert!(CONFIRM_PRELOAD.len() <= COLUMNS as usize);
+        // Each setting's description belongs to a setting in the menu, fits the box and
+        // has its letters.
+        for (var, about) in ITEM_ABOUT {
+            assert!(ITEMS.iter().any(|i| i.var == *var), "{var} is not in the menu");
+            for line in about {
+                assert!(line.len() <= COLUMNS as usize, "{line}");
+                assert!(line.bytes().all(|c| glyph(c) != glyph(b'#')), "{line}");
+            }
+        }
     }
 
     #[test]
